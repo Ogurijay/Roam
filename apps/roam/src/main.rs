@@ -1,12 +1,22 @@
 //! Roam：一套键鼠控制多台电脑。
 //!
-//! - `roam client`：被控端（Windows），打印连接码，等待主机连接
-//! - `roam host`：主机（macOS），采集键鼠并打开布局页面
+//! - `roam client`：被控端（Windows），托盘常驻，等待主机连接
+//! - `roam host`：主机（macOS），菜单栏常驻，采集键鼠并提供布局页面
 //! - `roam add <连接码>`：在主机上添加被控设备
+//!
+//! 不带参数运行时：Windows 默认启动被控端，macOS 默认启动主机。
 
+// Windows 上双击启动时不弹出黑色控制台窗口；从终端启动时再挂回终端输出
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod autostart;
 mod client;
 mod conn;
+mod dialog;
+mod discovery;
 mod host;
+mod pairing;
+mod tray;
 mod ui;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -15,7 +25,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use roam_core::{config::Store, router::InputEvent};
 
-use crate::host::Host;
+use crate::{
+    host::Host,
+    tray::{Action, Spec, Tray},
+};
 
 #[derive(Parser)]
 #[command(name = "roam", version, about = "一套键鼠控制多台电脑")]
@@ -23,8 +36,11 @@ struct Cli {
     /// 配置目录（同一台机器上同时运行主机和被控端测试时使用）
     #[arg(long, global = true, env = "ROAM_CONFIG_DIR")]
     config_dir: Option<PathBuf>,
+    /// 不显示托盘 / 菜单栏图标，只在终端运行
+    #[arg(long, global = true)]
+    no_tray: bool,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -53,26 +69,150 @@ enum Cmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// 开机自启时使用的参数。
+const CLIENT_ARGS: &[&str] = &["client"];
+const HOST_ARGS: &[&str] = &["host", "--no-browser"];
+
+fn main() -> Result<()> {
+    dialog::attach_parent_console();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,iroh=error".into()),
+                .unwrap_or_else(|_| "info,iroh=error,mdns_sd=error".into()),
         )
         .with_target(false)
         .init();
 
     let cli = Cli::parse();
     let store = Store::open(cli.config_dir)?;
-    match cli.cmd {
-        Cmd::Client => client::run(store).await,
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    let cmd = cli.cmd.unwrap_or(if cfg!(target_os = "macos") {
+        Cmd::Host {
+            ui_port: 7878,
+            no_browser: false,
+            demo: false,
+        }
+    } else {
+        Cmd::Client
+    });
+
+    match cmd {
         Cmd::Add { ticket, name } => add(store, &ticket, name),
+        Cmd::Client if cli.no_tray => runtime.block_on(client::run(store, None)),
+        Cmd::Client => run_client_with_tray(runtime, store),
         Cmd::Host {
             ui_port,
             no_browser,
             demo,
-        } => run_host(store, ui_port, no_browser, demo).await,
+        } => {
+            let (host, url) = runtime.block_on(start_host(store, ui_port, no_browser, demo))?;
+            if cli.no_tray {
+                runtime.block_on(async {
+                    tokio::signal::ctrl_c().await?;
+                    host.router.lock().unwrap().return_home();
+                    host.endpoint.close().await;
+                    anyhow::Ok(())
+                })
+            } else {
+                run_host_with_tray(runtime, host, url)
+            }
+        }
+    }
+}
+
+fn run_client_with_tray(runtime: tokio::runtime::Runtime, store: Store) -> Result<()> {
+    let tray = Tray::new();
+    let handle = tray.handle();
+    {
+        let store = store.clone();
+        let handle = handle.clone();
+        runtime.spawn(async move {
+            if let Err(err) = client::run(store, Some(handle.clone())).await {
+                dialog::alert("Roam 启动失败", &format!("{err:#}"));
+                handle.quit();
+            }
+        });
+    }
+    let spec = Spec {
+        copy_ticket: true,
+        revoke_hosts: true,
+        autostart: autostart::is_enabled(CLIENT_ARGS),
+        ..Default::default()
+    };
+    let initial = tray::State {
+        status: "正在启动…".into(),
+        tooltip: "Roam 被控端".into(),
+        ..Default::default()
+    };
+    tray.run(spec, initial, move |action| match action {
+        Action::CopyTicket => match std::fs::read_to_string(store.dir().join("ticket.txt")) {
+            Ok(code) => copy_to_clipboard(&code),
+            Err(_) => dialog::alert("Roam", "连接码还没有生成，请稍后再试。"),
+        },
+        Action::RevokeHosts => {
+            if dialog::confirm(
+                "Roam",
+                "撤销后，所有主机下次连接时都需要重新确认。\n\n确定撤销吗？",
+            ) && let Ok(mut config) = store.load()
+            {
+                config.trusted_hosts.clear();
+                let _ = store.save(&config);
+            }
+        }
+        Action::Autostart(on) => {
+            if let Err(err) = autostart::set_enabled(CLIENT_ARGS, on) {
+                dialog::alert("Roam", &format!("设置开机自启失败：{err:#}"));
+            }
+        }
+        Action::Quit => std::process::exit(0),
+        Action::OpenUi | Action::Pause(_) => {}
+    })
+}
+
+fn run_host_with_tray(
+    runtime: tokio::runtime::Runtime,
+    host: Arc<Host>,
+    url: String,
+) -> Result<()> {
+    let tray = Tray::new();
+    {
+        let _guard = runtime.enter();
+        host.start_tray_updates(tray.handle());
+    }
+    let spec = Spec {
+        open_ui: true,
+        pause: true,
+        autostart: autostart::is_enabled(HOST_ARGS),
+        ..Default::default()
+    };
+    let initial = host.tray_state();
+    // 运行时必须保持存活，交给闭包持有
+    tray.run(spec, initial, move |action| {
+        let _keep = &runtime;
+        match action {
+            Action::OpenUi => open_browser(&url),
+            Action::Pause(paused) => host.set_paused(paused),
+            Action::Autostart(on) => {
+                if let Err(err) = autostart::set_enabled(HOST_ARGS, on) {
+                    eprintln!("设置开机自启失败: {err:#}");
+                }
+            }
+            Action::Quit => {
+                host.router.lock().unwrap().return_home();
+                std::process::exit(0);
+            }
+            Action::CopyTicket | Action::RevokeHosts => {}
+        }
+    })
+}
+
+fn copy_to_clipboard(text: &str) {
+    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
+        Ok(()) => {}
+        Err(err) => dialog::alert("Roam", &format!("复制失败：{err}")),
     }
 }
 
@@ -96,7 +236,12 @@ fn add(store: Store, code: &str, name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn run_host(store: Store, ui_port: u16, no_browser: bool, demo: bool) -> Result<()> {
+async fn start_host(
+    store: Store,
+    ui_port: u16,
+    no_browser: bool,
+    demo: bool,
+) -> Result<(Arc<Host>, String)> {
     #[cfg(windows)]
     roam_input::windows::init_dpi();
 
@@ -120,15 +265,10 @@ async fn run_host(store: Store, ui_port: u16, no_browser: bool, demo: bool) -> R
     if !no_browser {
         open_browser(&url);
     }
-
     if demo {
         tokio::spawn(run_demo(host.clone()));
     }
-
-    tokio::signal::ctrl_c().await?;
-    host.router.lock().unwrap().return_home();
-    host.endpoint.close().await;
-    Ok(())
+    Ok((host, url))
 }
 
 #[cfg(target_os = "macos")]

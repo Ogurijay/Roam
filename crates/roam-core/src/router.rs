@@ -92,6 +92,8 @@ pub struct Router {
     remote_keys: HashSet<u16>,
     buttons_down: HashSet<MouseButton>,
     mouse_seq: u32,
+    /// 暂停时不会切到任何被控设备。
+    paused: bool,
 }
 
 impl Router {
@@ -108,11 +110,19 @@ impl Router {
             remote_keys: HashSet::new(),
             buttons_down: HashSet::new(),
             mouse_seq: 0,
+            paused: false,
         }
     }
 
     pub fn set_swap_cmd_ctrl(&mut self, swap: bool) {
         self.swap_cmd_ctrl = swap;
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        if paused {
+            self.return_home();
+        }
     }
 
     pub fn set_world(&mut self, world: World) {
@@ -201,8 +211,8 @@ impl Router {
     }
 
     fn move_local(&mut self, x: f64, y: f64, dx: f64, dy: f64) -> bool {
-        if !self.buttons_down.is_empty() {
-            return false; // 拖拽中不切屏
+        if self.paused || !self.buttons_down.is_empty() {
+            return false; // 暂停或拖拽中不切屏
         }
         let Some(host) = self.world.find(&self.host_id) else {
             return false;
@@ -655,6 +665,17 @@ mod tests {
         assert_eq!(r.focused(), None);
         assert_eq!(drain(&mut rx), vec![Outbound::Stream(StreamMsg::Leave)]);
         assert_eq!(cursor.0.lock().unwrap()[0], CursorCall::Warp(500.0, 400.0));
+    }
+
+    #[test]
+    fn pause_returns_home_and_blocks_switching() {
+        let (mut r, _, _rx) = setup();
+        r.handle(mv(999.0, 400.0, 5.0, 0.0));
+        r.set_paused(true);
+        assert_eq!(r.focused(), None);
+        assert!(!r.handle(mv(999.0, 400.0, 5.0, 0.0)));
+        r.set_paused(false);
+        assert!(r.handle(mv(999.0, 400.0, 5.0, 0.0)));
     }
 
     #[test]

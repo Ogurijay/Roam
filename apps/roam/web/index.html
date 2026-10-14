@@ -166,6 +166,19 @@
     font: 11px ui-monospace, Menlo, Consolas, monospace; padding: 1px 5px; border-radius: 4px;
     border: 1px solid var(--border); background: var(--bg);
   }
+  .pairing {
+    margin: 12px 20px 0; padding: 14px 18px; border-radius: 10px;
+    background: var(--accent-soft); border: 1px solid var(--accent); color: var(--text);
+    display: flex; align-items: center; gap: 16px;
+  }
+  .pairing .code { font: 600 26px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: 3px; color: var(--accent); }
+  .nearby-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
+  .nearby-item:first-of-type { border-top: none; padding-top: 0; }
+  .nearby-item .body { flex: 1; min-width: 0; }
+  .item .actions { display: flex; flex-direction: column; gap: 2px; align-items: flex-end; }
+  button.link.retry:hover { color: var(--accent); }
+  .pending { color: var(--accent); font-size: 12px; font-weight: 600; }
+  button.toggle-on { border-color: var(--warn-border); color: var(--warn-text); background: var(--warn-bg); }
   #toast {
     position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px);
     background: var(--text); color: var(--panel); padding: 8px 14px; border-radius: 8px;
@@ -181,7 +194,9 @@
   <div class="spacer"></div>
   <span class="pill focus" id="focusPill" hidden></span>
   <button id="homeBtn" hidden>回到本机</button>
+  <button id="pauseBtn" title="暂停后光标不会切到其他设备">暂停切屏</button>
 </header>
+<div class="pairing" id="pairing" hidden></div>
 <div class="banner" id="banner" hidden></div>
 <main>
   <div id="stage">
@@ -192,9 +207,13 @@
       <h2>设备</h2>
       <div id="deviceList"></div>
     </section>
+    <section id="nearbySection" hidden>
+      <h2>附近的设备</h2>
+      <div id="nearbyList"></div>
+    </section>
     <section>
-      <h2>添加被控设备</h2>
-      <p class="muted" style="margin:0 0 8px">在 Windows 上运行 <kbd>roam client</kbd>，把它打印的连接码粘贴到这里。</p>
+      <h2>通过连接码添加</h2>
+      <p class="muted" style="margin:0 0 8px">同一局域网的设备会自动出现在上面的「附近的设备」里。跨网络时，在被控端托盘菜单里点「复制连接码」，粘贴到这里。</p>
       <textarea id="ticket" rows="3" placeholder="roam1..."></textarea>
       <input type="text" id="peerName" placeholder="名称（可选，例如：公司台式机）">
       <button class="primary" id="addBtn">添加</button>
@@ -305,6 +324,21 @@ function render() {
   document.getElementById('homeBtn').hidden = !focused;
   if (focused) fp.innerHTML = `<span class="dot on"></span>正在控制：${esc(focused.name)}`;
 
+  const pauseBtn = document.getElementById('pauseBtn');
+  pauseBtn.textContent = state.paused ? '已暂停 · 点击恢复' : '暂停切屏';
+  pauseBtn.classList.toggle('toggle-on', state.paused);
+
+  const pending = state.devices.filter(d => d.pending_code);
+  const pairing = document.getElementById('pairing');
+  pairing.hidden = !pending.length;
+  if (pending.length) {
+    setHtml(pairing, pending.map(d =>
+      `<div style="flex:1">请在「${esc(d.name)}」弹出的窗口里确认连接请求，并核对两边的校验码一致</div><div class="code">${esc(d.pending_code)}</div>`
+    ).join(''));
+  }
+
+  renderNearby();
+
   const swap = document.getElementById('swapCmd');
   if (document.activeElement !== swap) swap.checked = state.swap_cmd_ctrl;
 
@@ -374,19 +408,26 @@ function renderStage() {
 
 function renderList() {
   const list = document.getElementById('deviceList');
-  list.innerHTML = state.devices.map(dev => {
-    const status = dev.is_host ? '本机' : dev.online ? `在线 · ${dev.path || ''}${rtt(dev)}` : (dev.displays.length ? '离线' : '等待首次连接');
+  setHtml(list, state.devices.map(dev => {
+    const status = dev.is_host ? '本机'
+      : dev.online ? `在线 · ${dev.path || ''}${rtt(dev)}`
+      : dev.pending_code ? ''
+      : dev.denied ? '已被拒绝'
+      : dev.error ? '离线 · 正在重连…'
+      : (dev.displays.length ? '离线' : '正在连接…');
+    const pendingLine = dev.pending_code ? `<div class="pending">等待对方确认 · 校验码 ${esc(dev.pending_code)}</div>` : '';
     const err = !dev.is_host && !dev.online && dev.error ? `<div class="err">${esc(dev.error)}</div>` : '';
+    const retry = !dev.is_host && !dev.online && (dev.denied || dev.error) ? `<button class="link retry" data-retry="${dev.id}">重试</button>` : '';
     return `<div class="item">
       <span class="dot ${dev.online ? 'on' : ''}" style="margin-top:7px"></span>
       <div class="body">
         <div class="title"><span>${esc(dev.name)}</span>
           <span class="badge ${dev.is_host ? '' : 'peer'}">${dev.is_host ? '主机' : esc(OS_LABEL[dev.os] || '被控')}</span></div>
-        <div class="sub">${esc(status)}</div>${err}
+        ${status ? `<div class="sub">${esc(status)}</div>` : ''}${pendingLine}${err}
       </div>
-      ${dev.is_host ? '' : `<button class="link" data-remove="${dev.id}">移除</button>`}
+      ${dev.is_host ? '' : `<div class="actions">${retry}<button class="link" data-remove="${dev.id}">移除</button></div>`}
     </div>`;
-  }).join('');
+  }).join(''));
 }
 
 const rtt = dev => dev.rtt_ms != null ? ` · ${dev.rtt_ms < 10 ? dev.rtt_ms.toFixed(1) : Math.round(dev.rtt_ms)} ms` : '';
@@ -497,7 +538,7 @@ document.getElementById('addBtn').addEventListener('click', async () => {
     await api('POST', '/api/peers', { ticket, name: name || null });
     document.getElementById('ticket').value = '';
     document.getElementById('peerName').value = '';
-    toast('已添加，正在连接…（首次连接需要在被控端终端输入 y 确认）');
+    toast('已添加，正在连接…（首次连接需要在被控端弹出的窗口里确认）');
     refresh();
   } catch (err) {
     toast(err.message);
@@ -505,6 +546,12 @@ document.getElementById('addBtn').addEventListener('click', async () => {
 });
 
 document.getElementById('deviceList').addEventListener('click', async e => {
+  const retryId = e.target.dataset?.retry;
+  if (retryId) {
+    try { await api('POST', `/api/peers/${encodeURIComponent(retryId)}/retry`); toast('正在重新连接…'); refresh(); }
+    catch (err) { toast(err.message); }
+    return;
+  }
   const id = e.target.dataset?.remove;
   if (!id) return;
   const dev = state.devices.find(d => d.id === id);
@@ -520,7 +567,47 @@ document.getElementById('swapCmd').addEventListener('change', async e => {
 
 document.getElementById('homeBtn').addEventListener('click', () => api('POST', '/api/home').then(refresh));
 
+function renderNearby() {
+  const section = document.getElementById('nearbySection');
+  section.hidden = !state.nearby.length;
+  setHtml(document.getElementById('nearbyList'), state.nearby.map(d => `
+    <div class="nearby-item">
+      <span class="dot on"></span>
+      <div class="body">
+        <div class="title"><b>${esc(d.name)}</b> <span class="badge peer">${esc(OS_LABEL[d.os] || '未知')}</span></div>
+        <div class="sub muted">${esc(d.id.slice(0, 10))}</div>
+      </div>
+      <button class="primary" data-add="${d.id}">添加</button>
+    </div>`).join(''));
+}
+
+document.getElementById('nearbyList').addEventListener('click', async e => {
+  const id = e.target.dataset?.add;
+  if (!id) return;
+  const d = state.nearby.find(n => n.id === id);
+  if (!d) return;
+  e.target.disabled = true;
+  try {
+    await api('POST', '/api/peers', { ticket: d.ticket, name: d.name });
+    toast(`已添加「${d.name}」，请在对方屏幕上确认连接请求`);
+    refresh();
+  } catch (err) {
+    toast(err.message);
+    e.target.disabled = false;
+  }
+});
+
+document.getElementById('pauseBtn').addEventListener('click', async () => {
+  try { await api('PUT', '/api/pause', { paused: !state.paused }); refresh(); }
+  catch (err) { toast(err.message); }
+});
+
 // ------------------------------------------------------------ 杂项
+
+// 内容没变就不动 DOM：每秒刷新时重建元素会吞掉正在进行的点击
+function setHtml(el, html) {
+  if (el._html !== html) { el.innerHTML = html; el._html = html; }
+}
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));

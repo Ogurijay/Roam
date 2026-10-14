@@ -7,7 +7,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use iroh::Endpoint;
+use iroh::{
+    Endpoint,
+    endpoint::{ConnectionError, VarInt},
+};
 use roam_core::{
     config::{Config, Peer, Store},
     layout::{DeviceGeom, World, default_position},
@@ -18,7 +21,27 @@ use roam_core::{
 use roam_proto::{ALPN, DisplayInfo, Hello, Os, StreamMsg};
 use tokio::{sync::mpsc, task::AbortHandle};
 
-use crate::conn::{read_msg, write_msg};
+use crate::{
+    conn::{read_msg, write_msg},
+    discovery::{self, Nearby},
+    pairing,
+    tray::{self, TrayHandle},
+};
+
+/// 被控端拒绝授权时关闭连接用的错误码。
+const DENIED: u32 = 1;
+
+/// 被控端拒绝了授权：不再自动重连，避免反复弹窗打扰对方。
+#[derive(Debug)]
+struct Denied;
+
+impl std::fmt::Display for Denied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("对方拒绝了授权，可以在页面上点「重试」重新请求")
+    }
+}
+
+impl std::error::Error for Denied {}
 
 /// 被控设备的运行时状态（不落盘）。
 #[derive(Debug, Clone, Default)]
@@ -27,6 +50,10 @@ pub struct PeerStatus {
     pub path: Option<PathKind>,
     pub rtt_ms: Option<f64>,
     pub error: Option<String>,
+    /// 等待被控端确认时显示的校验码。
+    pub pending_code: Option<String>,
+    /// 被拒绝后停止重连，等用户手动重试。
+    pub denied: bool,
 }
 
 pub struct Host {
@@ -39,7 +66,11 @@ pub struct Host {
     pub status: Mutex<HashMap<String, PeerStatus>>,
     /// 键鼠采集是否就绪；失败时为原因说明。
     pub capture: Mutex<Result<(), String>>,
+    /// 局域网里发现的被控设备。
+    pub nearby: Nearby,
+    pub paused: Mutex<bool>,
     tasks: Mutex<HashMap<String, AbortHandle>>,
+    _mdns: Option<mdns_sd::ServiceDaemon>,
 }
 
 impl Host {
@@ -50,6 +81,14 @@ impl Host {
     ) -> Result<Arc<Self>> {
         let config = store.load()?;
         let host_id = endpoint.id().to_string();
+        let nearby = Nearby::default();
+        let mdns = match discovery::browse(nearby.clone()) {
+            Ok(daemon) => Some(daemon),
+            Err(err) => {
+                tracing::warn!("局域网发现不可用: {err:#}");
+                None
+            }
+        };
         let mut router = Router::new(host_id.clone(), Os::current(), cursor);
         router.set_swap_cmd_ctrl(config.swap_cmd_ctrl);
         let host = Arc::new(Self {
@@ -61,10 +100,24 @@ impl Host {
             displays: roam_input::displays(),
             status: Mutex::new(HashMap::new()),
             capture: Mutex::new(Err("尚未启动".into())),
+            nearby: nearby.clone(),
+            paused: Mutex::new(false),
             tasks: Mutex::new(HashMap::new()),
+            _mdns: mdns,
         });
         host.rebuild_world();
         Ok(host)
+    }
+
+    /// 定期把状态推给菜单栏图标（需要在 tokio 运行时上下文中调用）。
+    pub fn start_tray_updates(self: &Arc<Self>, tray: TrayHandle) {
+        let host = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tray.update(host.tray_state());
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        });
     }
 
     pub fn start(self: &Arc<Self>) {
@@ -80,6 +133,66 @@ impl Host {
                 router.lock().unwrap().tick();
             }
         });
+    }
+
+    /// 菜单栏显示的状态。
+    pub fn tray_state(&self) -> tray::State {
+        let focused = self.router.lock().unwrap().focused().map(str::to_string);
+        let paused = *self.paused.lock().unwrap();
+        let online = self
+            .status
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.online)
+            .count();
+        let focused_name = {
+            let config = self.config.lock().unwrap();
+            focused.and_then(|id| {
+                config
+                    .peers
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone())
+            })
+        };
+        let status = match (&focused_name, paused) {
+            (_, true) => "已暂停切屏".to_string(),
+            (Some(name), _) => format!("正在控制「{name}」"),
+            (None, _) => format!("在本机 · {online} 台设备在线"),
+        };
+        let title = match (&focused_name, paused) {
+            (_, true) => Some("⏸".to_string()),
+            (Some(name), _) => Some(format!("→ {name}")),
+            (None, _) => None,
+        };
+        tray::State {
+            title,
+            tooltip: format!("Roam · {status}"),
+            status,
+            paused,
+        }
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        *self.paused.lock().unwrap() = paused;
+        self.router.lock().unwrap().set_paused(paused);
+    }
+
+    /// 被拒绝或出错后手动重试。
+    pub fn retry_peer(self: &Arc<Self>, id: &str) -> Result<()> {
+        let peer = self
+            .config
+            .lock()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .context("没有这台设备")?;
+        self.status.lock().unwrap().remove(id);
+        self.spawn_peer(peer);
+        Ok(())
     }
 
     pub fn save_config(&self) -> Result<()> {
@@ -195,12 +308,14 @@ impl Host {
         loop {
             let result = self.peer_session(&peer).await;
             self.router.lock().unwrap().remove_peer(&peer.id);
+            let denied = matches!(&result, Err(e) if e.is::<Denied>());
             {
                 let mut status = self.status.lock().unwrap();
                 let entry = status.entry(peer.id.clone()).or_default();
                 let was_online = entry.online;
                 *entry = PeerStatus {
-                    error: result.err().map(|e| format!("{e:#}")),
+                    error: result.err().map(|e| friendly_error(&e)),
+                    denied,
                     ..Default::default()
                 };
                 if was_online {
@@ -208,6 +323,9 @@ impl Host {
                 }
             }
             self.rebuild_world();
+            if denied {
+                return;
+            }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(10));
         }
@@ -217,7 +335,7 @@ impl Host {
         let addr = ticket::decode(&peer.ticket)?;
         let conn = tokio::time::timeout(Duration::from_secs(15), self.endpoint.connect(addr, ALPN))
             .await
-            .context("连接超时")??;
+            .context("连接超时：对方可能没有运行 Roam，或网络不通")??;
         let (mut send, mut recv) = conn.open_bi().await?;
         let name = self.config.lock().unwrap().name.clone();
         write_msg(
@@ -229,11 +347,37 @@ impl Host {
             }),
         )
         .await?;
-        let hello = match tokio::time::timeout(Duration::from_secs(60), read_msg(&mut recv)).await {
-            Ok(Ok(StreamMsg::Hello(hello))) => hello,
-            Ok(Ok(_)) => bail!("对方没有发送 Hello"),
-            Ok(Err(err)) => return Err(err.context("对方拒绝或断开（被控端是否已允许本机？）")),
-            Err(_) => bail!("等待对方确认超时（请在被控端终端里输入 y 允许）"),
+        // 已信任的主机会立即收到回应；否则对方正在弹窗确认，页面上显示同一个校验码供核对
+        let code = pairing::verification_code(&self.host_id, &peer.id);
+        let first = match tokio::time::timeout(Duration::from_millis(500), read_msg(&mut recv))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.status.lock().unwrap().insert(
+                    peer.id.clone(),
+                    PeerStatus {
+                        pending_code: Some(code),
+                        ..Default::default()
+                    },
+                );
+                match tokio::time::timeout(Duration::from_secs(120), read_msg(&mut recv)).await {
+                    Ok(result) => result,
+                    Err(_) => bail!("等待对方确认超时"),
+                }
+            }
+        };
+        let hello = match first {
+            Ok(StreamMsg::Hello(hello)) => hello,
+            Ok(_) => bail!("对方没有发送 Hello"),
+            Err(err) => {
+                if let Some(ConnectionError::ApplicationClosed(close)) = conn.close_reason()
+                    && close.error_code == VarInt::from_u32(DENIED)
+                {
+                    return Err(Denied.into());
+                }
+                return Err(err);
+            }
         };
 
         // 记住对方的名字和显示器，离线时布局里也能显示
@@ -292,7 +436,7 @@ impl Host {
                 online: true,
                 path: path.as_ref().map(|p| p.0),
                 rtt_ms: path.map(|p| p.2.as_secs_f64() * 1000.0),
-                error: None,
+                ..Default::default()
             },
         );
     }
@@ -310,4 +454,24 @@ impl CursorControl for NoopCursor {
         tracing::info!("光标回到主机 ({x:.0}, {y:.0})");
     }
     fn set_locked(&mut self, _locked: bool) {}
+}
+
+/// 把底层错误翻译成用户看得懂的说明。
+fn friendly_error(err: &anyhow::Error) -> String {
+    if err.is::<Denied>() {
+        return err.to_string();
+    }
+    let text = format!("{err:#}");
+    if text.contains("doesn't support any known protocol")
+        || text.contains("no application protocol")
+    {
+        return "对方的 Roam 版本不兼容，请两边都更新到最新版".into();
+    }
+    if text.contains("timed out") || text.contains("TimedOut") {
+        return "连接超时：对方可能已关闭 Roam，或网络不通".into();
+    }
+    if text.contains("closed by peer") || text.contains("reset") {
+        return "对方断开了连接".into();
+    }
+    text
 }

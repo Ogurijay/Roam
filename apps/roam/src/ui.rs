@@ -14,7 +14,7 @@ use roam_core::config::Point;
 use roam_proto::{DisplayInfo, Os};
 use serde::{Deserialize, Serialize};
 
-use crate::host::Host;
+use crate::{discovery::Discovered, host::Host};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
@@ -25,6 +25,8 @@ pub async fn serve(host: Arc<Host>, port: u16) -> Result<SocketAddr> {
         .route("/api/layout", put(set_layout))
         .route("/api/peers", post(add_peer))
         .route("/api/peers/{id}", delete(remove_peer))
+        .route("/api/peers/{id}/retry", post(retry_peer))
+        .route("/api/pause", put(set_pause))
         .route("/api/settings", put(set_settings))
         .route("/api/home", post(go_home))
         .with_state(host);
@@ -48,6 +50,8 @@ struct DeviceView {
     path: Option<&'static str>,
     rtt_ms: Option<f64>,
     error: Option<String>,
+    pending_code: Option<String>,
+    denied: bool,
     displays: Vec<DisplayInfo>,
     pos: Option<Point>,
 }
@@ -59,7 +63,10 @@ struct StateView {
     capture_message: Option<String>,
     focused: Option<String>,
     swap_cmd_ctrl: bool,
+    paused: bool,
     devices: Vec<DeviceView>,
+    /// 局域网里发现、但还没添加的设备。
+    nearby: Vec<Discovered>,
 }
 
 async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
@@ -77,6 +84,8 @@ async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
         path: None,
         rtt_ms: None,
         error: None,
+        pending_code: None,
+        denied: false,
         displays: host.displays.clone(),
         pos: config.layout.get(&host.host_id).copied(),
     }];
@@ -91,6 +100,8 @@ async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
             path: s.path.map(|k| k.label()),
             rtt_ms: s.rtt_ms,
             error: s.error,
+            pending_code: s.pending_code,
+            denied: s.denied,
             displays: p.displays.clone(),
             pos: config.layout.get(&p.id).copied(),
         }
@@ -102,6 +113,13 @@ async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
         capture_message: capture.err(),
         focused,
         swap_cmd_ctrl: config.swap_cmd_ctrl,
+        paused: *host.paused.lock().unwrap(),
+        nearby: host
+            .nearby
+            .list()
+            .into_iter()
+            .filter(|d| d.id != host.host_id && !config.peers.iter().any(|p| p.id == d.id))
+            .collect(),
         devices,
     })
 }
@@ -181,5 +199,23 @@ async fn set_settings(
 
 async fn go_home(State(host): State<Arc<Host>>) -> StatusCode {
     host.router.lock().unwrap().return_home();
+    StatusCode::NO_CONTENT
+}
+
+async fn retry_peer(
+    State(host): State<Arc<Host>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    host.retry_peer(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PauseBody {
+    paused: bool,
+}
+
+async fn set_pause(State(host): State<Arc<Host>>, Json(body): Json<PauseBody>) -> StatusCode {
+    host.set_paused(body.paused);
     StatusCode::NO_CONTENT
 }
