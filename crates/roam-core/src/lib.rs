@@ -6,5 +6,6 @@ pub mod layout;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod router;
+pub mod settings;
 #[cfg(feature = "net")]
 pub mod ticket;

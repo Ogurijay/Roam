@@ -89,8 +89,7 @@ impl Host {
                 None
             }
         };
-        let mut router = Router::new(host_id.clone(), Os::current(), cursor);
-        router.set_swap_cmd_ctrl(config.swap_cmd_ctrl);
+        let router = Router::new(host_id.clone(), Os::current(), cursor);
         let host = Arc::new(Self {
             store,
             config: Mutex::new(config),
@@ -139,6 +138,7 @@ impl Host {
     pub fn tray_state(&self) -> tray::State {
         let focused = self.router.lock().unwrap().focused().map(str::to_string);
         let paused = *self.paused.lock().unwrap();
+        let locked = self.router.lock().unwrap().edge_locked();
         let online = self
             .status
             .lock()
@@ -156,11 +156,14 @@ impl Host {
                     .map(|p| p.name.clone())
             })
         };
-        let status = match (&focused_name, paused) {
+        let mut status = match (&focused_name, paused) {
             (_, true) => "已暂停切屏".to_string(),
             (Some(name), _) => format!("正在控制「{name}」"),
             (None, _) => format!("在本机 · {online} 台设备在线"),
         };
+        if locked && !paused {
+            status.push_str(" · 已锁定当前屏幕");
+        }
         let title = match (&focused_name, paused) {
             (_, true) => Some("⏸".to_string()),
             (Some(name), _) => Some(format!("→ {name}")),
@@ -214,7 +217,7 @@ impl Host {
             config
                 .peers
                 .iter()
-                .filter(|p| !p.displays.is_empty())
+                .filter(|p| !p.displays.is_empty() && p.settings.enabled)
                 .map(|p| (p.id.clone(), p.displays.clone())),
         );
         for (id, displays) in entries {
@@ -245,8 +248,26 @@ impl Host {
                 .collect(),
         };
         drop(status);
+        let mut router = self.router.lock().unwrap();
+        router.set_swap_cmd_ctrl(config.swap_cmd_ctrl);
+        router.set_switch_settings(config.switching.clone());
+        router.set_device_settings(
+            config
+                .peers
+                .iter()
+                .map(|p| (p.id.clone(), p.settings.clone()))
+                .collect(),
+        );
+        router.set_device_order(
+            config
+                .peers
+                .iter()
+                .filter(|p| p.settings.enabled)
+                .map(|p| p.id.clone())
+                .collect(),
+        );
         drop(config);
-        self.router.lock().unwrap().set_world(world);
+        router.set_world(world);
     }
 
     pub fn add_peer(self: &Arc<Self>, code: &str, name: Option<String>) -> Result<String> {
@@ -268,6 +289,7 @@ impl Host {
                     .unwrap_or_else(|| format!("设备 {}", addr.id.fmt_short())),
                 os: None,
                 displays: Vec::new(),
+                settings: Default::default(),
             };
             config.peers.push(peer.clone());
             peer

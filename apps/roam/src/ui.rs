@@ -10,7 +10,10 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use roam_core::config::Point;
+use roam_core::{
+    config::Point,
+    settings::{DeviceSettings, SwitchSettings},
+};
 use roam_proto::{DisplayInfo, Os};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +29,8 @@ pub async fn serve(host: Arc<Host>, port: u16) -> Result<SocketAddr> {
         .route("/api/peers", post(add_peer))
         .route("/api/peers/{id}", delete(remove_peer))
         .route("/api/peers/{id}/retry", post(retry_peer))
+        .route("/api/peers/{id}/settings", put(set_peer_settings))
+        .route("/api/lock", put(set_lock))
         .route("/api/pause", put(set_pause))
         .route("/api/settings", put(set_settings))
         .route("/api/home", post(go_home))
@@ -52,6 +57,7 @@ struct DeviceView {
     error: Option<String>,
     pending_code: Option<String>,
     denied: bool,
+    settings: Option<DeviceSettings>,
     displays: Vec<DisplayInfo>,
     pos: Option<Point>,
 }
@@ -63,7 +69,9 @@ struct StateView {
     capture_message: Option<String>,
     focused: Option<String>,
     swap_cmd_ctrl: bool,
+    switching: SwitchSettings,
     paused: bool,
+    edge_locked: bool,
     devices: Vec<DeviceView>,
     /// 局域网里发现、但还没添加的设备。
     nearby: Vec<Discovered>,
@@ -86,6 +94,7 @@ async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
         error: None,
         pending_code: None,
         denied: false,
+        settings: None,
         displays: host.displays.clone(),
         pos: config.layout.get(&host.host_id).copied(),
     }];
@@ -102,6 +111,7 @@ async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
             error: s.error,
             pending_code: s.pending_code,
             denied: s.denied,
+            settings: Some(p.settings.clone()),
             displays: p.displays.clone(),
             pos: config.layout.get(&p.id).copied(),
         }
@@ -113,7 +123,9 @@ async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
         capture_message: capture.err(),
         focused,
         swap_cmd_ctrl: config.swap_cmd_ctrl,
+        switching: config.switching.clone(),
         paused: *host.paused.lock().unwrap(),
+        edge_locked: host.router.lock().unwrap().edge_locked(),
         nearby: host
             .nearby
             .list()
@@ -181,20 +193,68 @@ async fn remove_peer(
 
 #[derive(Deserialize)]
 struct SettingsBody {
-    swap_cmd_ctrl: bool,
+    swap_cmd_ctrl: Option<bool>,
+    switching: Option<SwitchSettings>,
 }
 
 async fn set_settings(
     State(host): State<Arc<Host>>,
     Json(body): Json<SettingsBody>,
 ) -> Result<StatusCode, ApiError> {
-    host.config.lock().unwrap().swap_cmd_ctrl = body.swap_cmd_ctrl;
+    {
+        let mut config = host.config.lock().unwrap();
+        if let Some(swap) = body.swap_cmd_ctrl {
+            config.swap_cmd_ctrl = swap;
+        }
+        if let Some(switching) = body.switching {
+            config.switching = switching.sanitized();
+        }
+    }
     host.save_config()?;
-    host.router
-        .lock()
-        .unwrap()
-        .set_swap_cmd_ctrl(body.swap_cmd_ctrl);
+    host.rebuild_world();
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PeerSettingsBody {
+    name: Option<String>,
+    settings: Option<DeviceSettings>,
+}
+
+async fn set_peer_settings(
+    State(host): State<Arc<Host>>,
+    Path(id): Path<String>,
+    Json(body): Json<PeerSettingsBody>,
+) -> Result<StatusCode, ApiError> {
+    {
+        let mut config = host.config.lock().unwrap();
+        let peer = config
+            .peer_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("没有这台设备"))?;
+        if let Some(name) = body
+            .name
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+        {
+            peer.name = name;
+        }
+        if let Some(settings) = body.settings {
+            peer.settings = settings.sanitized();
+        }
+    }
+    host.save_config()?;
+    host.rebuild_world();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct LockBody {
+    locked: bool,
+}
+
+async fn set_lock(State(host): State<Arc<Host>>, Json(body): Json<LockBody>) -> StatusCode {
+    host.router.lock().unwrap().set_edge_locked(body.locked);
+    StatusCode::NO_CONTENT
 }
 
 async fn go_home(State(host): State<Arc<Host>>) -> StatusCode {

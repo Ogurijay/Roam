@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use roam_proto::{DisplayInfo, Os};
 use serde::{Deserialize, Serialize};
 
+use crate::settings::{DeviceSettings, SwitchSettings};
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub x: f64,
@@ -31,6 +33,8 @@ pub struct Peer {
     pub os: Option<Os>,
     #[serde(default)]
     pub displays: Vec<DisplayInfo>,
+    #[serde(default)]
+    pub settings: DeviceSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +52,9 @@ pub struct Config {
     /// 控制 Windows 时把 Cmd 和 Ctrl 对调。
     #[serde(default = "default_true")]
     pub swap_cmd_ctrl: bool,
+    /// 切屏手感。
+    #[serde(default)]
+    pub switching: SwitchSettings,
 }
 
 fn default_true() -> bool {
@@ -62,6 +69,7 @@ impl Config {
             trusted_hosts: Vec::new(),
             layout: BTreeMap::new(),
             swap_cmd_ctrl: true,
+            switching: SwitchSettings::default(),
         }
     }
 

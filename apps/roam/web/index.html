@@ -179,6 +179,29 @@
   button.link.retry:hover { color: var(--accent); }
   .pending { color: var(--accent); font-size: 12px; font-weight: 600; }
   button.toggle-on { border-color: var(--warn-border); color: var(--warn-text); background: var(--warn-bg); }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 8px; }
+  .seg button { border: none; border-radius: 0; padding: 5px 10px; font-size: 12px; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .field { margin: 10px 0; }
+  .field > .head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }
+  .field > .head .val { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .field .desc { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  select {
+    font: inherit; font-size: 13px; color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 7px; padding: 4px 8px; width: 100%;
+  }
+  .num {
+    display: inline-flex; align-items: center; justify-content: center; flex: none;
+    min-width: 18px; height: 18px; border-radius: 5px; font-size: 11px; font-weight: 600;
+    background: var(--bg); border: 1px solid var(--border); color: var(--muted); margin-top: 2px;
+  }
+  .item.selectable { cursor: pointer; border-radius: 8px; }
+  .item.selected { background: var(--accent-soft); margin: 0 -8px; padding-left: 8px; padding-right: 8px; }
+  .device.selected .screen { outline: 2px solid var(--accent); outline-offset: 3px; }
+  #deviceEditor h3 { margin: 0 0 6px; font-size: 14px; }
+  .hotkeys { font-size: 12px; color: var(--muted); line-height: 2; }
   #toast {
     position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px);
     background: var(--text); color: var(--panel); padding: 8px 14px; border-radius: 8px;
@@ -194,6 +217,7 @@
   <div class="spacer"></div>
   <span class="pill focus" id="focusPill" hidden></span>
   <button id="homeBtn" hidden>回到本机</button>
+  <button id="lockBtn" title="锁定后光标不会从边缘切走，快捷键仍可用">锁定当前屏幕</button>
   <button id="pauseBtn" title="暂停后光标不会切到其他设备">暂停切屏</button>
 </header>
 <div class="pairing" id="pairing" hidden></div>
@@ -204,9 +228,10 @@
   </div>
   <aside>
     <section>
-      <h2>设备</h2>
+      <h2>设备 <span class="muted" style="font-weight:400">· 点击设备可单独设置</span></h2>
       <div id="deviceList"></div>
     </section>
+    <section id="deviceEditor" hidden></section>
     <section id="nearbySection" hidden>
       <h2>附近的设备</h2>
       <div id="nearbyList"></div>
@@ -218,16 +243,70 @@
       <input type="text" id="peerName" placeholder="名称（可选，例如：公司台式机）">
       <button class="primary" id="addBtn">添加</button>
     </section>
-    <section>
-      <h2>设置</h2>
-      <label class="toggle">
-        <input type="checkbox" id="swapCmd">
-        <span>控制 Windows 时 Cmd ↔ Ctrl 对调<br><span class="muted">开启后 Cmd+C / Cmd+V 在 Windows 上就是 Ctrl+C / Ctrl+V</span></span>
-      </label>
+    <section id="switchSection">
+      <h2>切屏手感</h2>
+      <div class="field">
+        <div class="head"><span>切屏方式</span></div>
+        <div class="seg" id="modeSeg">
+          <button data-mode="instant">直接切</button>
+          <button data-mode="dwell">停留后切</button>
+          <button data-mode="double">撞两下</button>
+        </div>
+        <div class="field" id="dwellField">
+          <div class="head"><span>停留时间</span><span class="val" id="dwellVal"></span></div>
+          <input type="range" id="dwell" min="50" max="1000" step="10">
+          <div class="desc">光标顶住边缘这么久才切过去，防止误切。</div>
+        </div>
+        <div class="field" id="tapField">
+          <div class="head"><span>两次撞边的最大间隔</span><span class="val" id="tapVal"></span></div>
+          <input type="range" id="tapWindow" min="200" max="1000" step="10">
+          <div class="desc">在这个时间内撞两次边缘才切过去。</div>
+        </div>
+      </div>
+      <div class="field">
+        <div class="head"><span>需要按住</span></div>
+        <select id="requireMod">
+          <option value="">不需要</option>
+          <option value="shift">Shift</option>
+          <option value="ctrl">Ctrl</option>
+          <option value="alt">Option</option>
+          <option value="cmd">Cmd</option>
+        </select>
+        <div class="desc">只有按住这个键时，光标才会从边缘切走。</div>
+      </div>
+      <div class="field">
+        <div class="head"><span>角落死区</span><span class="val" id="cornerVal"></span></div>
+        <input type="range" id="corner" min="0" max="200" step="5">
+        <div class="desc">屏幕四角附近不切屏，避免和触发角冲突。</div>
+      </div>
+      <div class="field">
+        <div class="head"><span>跨屏位置</span></div>
+        <div class="seg" id="mappingSeg">
+          <button data-mapping="aligned">按布局对齐</button>
+          <button data-mapping="proportional">按比例</button>
+        </div>
+        <div class="desc">按比例：从屏幕边 30% 的位置离开，就从对方屏幕边 30% 的位置进入，两块屏幕大小差别大时更顺手。</div>
+      </div>
+      <div class="field">
+        <label class="toggle">
+          <input type="checkbox" id="swapCmd">
+          <span>控制 Windows 时 Cmd ↔ Ctrl 对调<br><span class="muted">开启后 Cmd+C / Cmd+V 在 Windows 上就是 Ctrl+C / Ctrl+V</span></span>
+        </label>
+      </div>
     </section>
     <section>
       <h2>快捷键</h2>
-      <div class="muted">强制回到本机：<kbd>Ctrl</kbd> + <kbd>Option</kbd> + <kbd>Cmd</kbd> + <kbd>Esc</kbd></div>
+      <div class="field" style="margin-top:0">
+        <div class="head"><span>修饰键组合</span></div>
+        <select id="hotkeyMods">
+          <option value="ctrl,alt,cmd">Ctrl + Option + Cmd</option>
+          <option value="ctrl,alt">Ctrl + Option</option>
+          <option value="ctrl,cmd">Ctrl + Cmd</option>
+          <option value="alt,cmd">Option + Cmd</option>
+          <option value="ctrl,shift">Ctrl + Shift</option>
+        </select>
+      </div>
+      <div class="hotkeys" id="hotkeyHelp"></div>
     </section>
   </aside>
 </main>
@@ -324,6 +403,10 @@ function render() {
   document.getElementById('homeBtn').hidden = !focused;
   if (focused) fp.innerHTML = `<span class="dot on"></span>正在控制：${esc(focused.name)}`;
 
+  const lockBtn = document.getElementById('lockBtn');
+  lockBtn.textContent = state.edge_locked ? '已锁定 · 点击解锁' : '锁定当前屏幕';
+  lockBtn.classList.toggle('toggle-on', state.edge_locked);
+
   const pauseBtn = document.getElementById('pauseBtn');
   pauseBtn.textContent = state.paused ? '已暂停 · 点击恢复' : '暂停切屏';
   pauseBtn.classList.toggle('toggle-on', state.paused);
@@ -338,6 +421,8 @@ function render() {
   }
 
   renderNearby();
+  renderSwitching();
+  renderEditor();
 
   const swap = document.getElementById('swapCmd');
   if (document.activeElement !== swap) swap.checked = state.swap_cmd_ctrl;
@@ -376,6 +461,7 @@ function renderStage() {
     el.classList.toggle('offline', !dev.online);
     el.classList.toggle('focused', dev.id === state.focused);
     el.classList.toggle('dragging', drag?.id === dev.id);
+    el.classList.toggle('selected', selectedId === dev.id);
 
     const b = bboxLocal(dev.displays);
     const status = dev.is_host ? '本机 · 主机' : dev.online ? (dev.path || '在线') + rtt(dev) : '离线';
@@ -418,11 +504,14 @@ function renderList() {
     const pendingLine = dev.pending_code ? `<div class="pending">等待对方确认 · 校验码 ${esc(dev.pending_code)}</div>` : '';
     const err = !dev.is_host && !dev.online && dev.error ? `<div class="err">${esc(dev.error)}</div>` : '';
     const retry = !dev.is_host && !dev.online && (dev.denied || dev.error) ? `<button class="link retry" data-retry="${dev.id}">重试</button>` : '';
-    return `<div class="item">
+    const n = deviceNumber(dev);
+    const disabled = dev.settings && !dev.settings.enabled;
+    return `<div class="item ${dev.is_host ? '' : 'selectable'} ${selectedId === dev.id ? 'selected' : ''}" data-select="${dev.is_host ? '' : dev.id}">
+      <span class="num" title="快捷键编号">${n ?? '–'}</span>
       <span class="dot ${dev.online ? 'on' : ''}" style="margin-top:7px"></span>
       <div class="body">
         <div class="title"><span>${esc(dev.name)}</span>
-          <span class="badge ${dev.is_host ? '' : 'peer'}">${dev.is_host ? '主机' : esc(OS_LABEL[dev.os] || '被控')}</span></div>
+          <span class="badge ${dev.is_host ? '' : 'peer'}">${dev.is_host ? '主机' : esc(OS_LABEL[dev.os] || '被控')}</span>${disabled ? '<span class="badge" style="background:var(--bg);color:var(--muted)">已停用</span>' : ''}</div>
         ${status ? `<div class="sub">${esc(status)}</div>` : ''}${pendingLine}${err}
       </div>
       ${dev.is_host ? '' : `<div class="actions">${retry}<button class="link" data-remove="${dev.id}">移除</button></div>`}
@@ -458,12 +547,14 @@ function sharedEdges(devs) {
 function startDrag(e, id) {
   e.preventDefault();
   e.currentTarget.setPointerCapture(e.pointerId);
-  drag = { id, sx: e.clientX, sy: e.clientY, orig: { ...positions[id] }, snap: null };
+  drag = { id, sx: e.clientX, sy: e.clientY, orig: { ...positions[id] }, snap: null, moved: false };
   render();
 }
 
 window.addEventListener('pointermove', e => {
   if (!drag) return;
+  if (!drag.moved && Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) < 4) return;
+  drag.moved = true;
   const p = {
     x: drag.orig.x + (e.clientX - drag.sx) / view.scale,
     y: drag.orig.y + (e.clientY - drag.sy) / view.scale,
@@ -475,9 +566,15 @@ window.addEventListener('pointermove', e => {
 
 window.addEventListener('pointerup', async () => {
   if (!drag) return;
-  const { id, snap, orig } = drag;
-  positions[id] = snap || orig;
+  const { id, snap, orig, moved } = drag;
+  positions[id] = moved ? (snap || orig) : orig;
   drag = null;
+  if (!moved) {
+    const dev = state.devices.find(d => d.id === id);
+    if (dev && !dev.is_host) selectDevice(id);
+    render();
+    return;
+  }
   fitView();
   render();
   try {
@@ -553,7 +650,11 @@ document.getElementById('deviceList').addEventListener('click', async e => {
     return;
   }
   const id = e.target.dataset?.remove;
-  if (!id) return;
+  if (!id) {
+    const item = e.target.closest('[data-select]');
+    if (item?.dataset.select) selectDevice(item.dataset.select);
+    return;
+  }
   const dev = state.devices.find(d => d.id === id);
   if (!confirm(`移除「${dev?.name}」？之后需要重新粘贴连接码才能再次控制它。`)) return;
   try { await api('DELETE', '/api/peers/' + encodeURIComponent(id)); refresh(); }
@@ -601,6 +702,161 @@ document.getElementById('pauseBtn').addEventListener('click', async () => {
   try { await api('PUT', '/api/pause', { paused: !state.paused }); refresh(); }
   catch (err) { toast(err.message); }
 });
+
+// ------------------------------------------------------------ 切屏手感
+
+const MOD_LABEL = { ctrl: 'Ctrl', alt: 'Option', cmd: 'Cmd', shift: 'Shift' };
+let selectedId = null;
+
+function deviceNumber(dev) {
+  if (dev.is_host) return 1;
+  if (dev.settings && !dev.settings.enabled) return null;
+  const peers = state.devices.filter(d => !d.is_host && (!d.settings || d.settings.enabled));
+  const i = peers.findIndex(d => d.id === dev.id);
+  return i >= 0 && i < 8 ? i + 2 : null;
+}
+
+/// 用户正在操作的控件不要被定时刷新覆盖
+const busy = el => document.activeElement === el || el.matches(':active');
+
+function setValue(el, value) {
+  if (busy(el)) return;
+  if (el.type === 'checkbox') el.checked = value; else el.value = value;
+}
+
+function renderSwitching() {
+  const sw = state.switching;
+  const mode = sw.double_tap ? 'double' : sw.dwell_ms > 0 ? 'dwell' : 'instant';
+  document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
+  document.getElementById('dwellField').hidden = mode !== 'dwell';
+  document.getElementById('tapField').hidden = mode !== 'double';
+  setValue(document.getElementById('dwell'), sw.dwell_ms || 250);
+  document.getElementById('dwellVal').textContent = `${sw.dwell_ms || 250} ms`;
+  setValue(document.getElementById('tapWindow'), sw.double_tap_window_ms);
+  document.getElementById('tapVal').textContent = `${sw.double_tap_window_ms} ms`;
+  setValue(document.getElementById('requireMod'), sw.require_modifier || '');
+  setValue(document.getElementById('corner'), sw.corner_deadzone);
+  document.getElementById('cornerVal').textContent = sw.corner_deadzone ? `${Math.round(sw.corner_deadzone)} pt` : '关闭';
+  document.querySelectorAll('#mappingSeg button').forEach(b => b.classList.toggle('on', b.dataset.mapping === sw.edge_mapping));
+  setValue(document.getElementById('hotkeyMods'), sw.hotkey_modifiers.join(','));
+
+  const combo = sw.hotkey_modifiers.map(m => `<kbd>${MOD_LABEL[m]}</kbd>`).join(' + ');
+  const numbered = state.devices
+    .map(d => [deviceNumber(d), d.name])
+    .filter(([n]) => n)
+    .map(([n, name]) => `${combo} + <kbd>${n}</kbd>：切到「${esc(name)}」`)
+    .join('<br>');
+  setHtml(document.getElementById('hotkeyHelp'),
+    `${combo} + <kbd>Esc</kbd>：回到本机<br>${numbered}<br>${combo} + <kbd>L</kbd>：锁定 / 解锁当前屏幕`);
+}
+
+let saveTimer;
+/// 改设置时先更新本地状态让界面立即响应，再合并短时间内的多次修改一起保存
+function saveSwitching(patch) {
+  Object.assign(state.switching, patch);
+  renderSwitching();
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    api('PUT', '/api/settings', { switching: state.switching }).catch(err => toast('保存失败：' + err.message));
+  }, 250);
+}
+
+document.getElementById('modeSeg').addEventListener('click', e => {
+  const mode = e.target.dataset?.mode;
+  if (!mode) return;
+  const dwell = Number(document.getElementById('dwell').value) || 250;
+  saveSwitching({
+    double_tap: mode === 'double',
+    dwell_ms: mode === 'dwell' ? dwell : 0,
+  });
+});
+document.getElementById('dwell').addEventListener('input', e => saveSwitching({ dwell_ms: Number(e.target.value) }));
+document.getElementById('tapWindow').addEventListener('input', e => saveSwitching({ double_tap_window_ms: Number(e.target.value) }));
+document.getElementById('requireMod').addEventListener('change', e => saveSwitching({ require_modifier: e.target.value || null }));
+document.getElementById('corner').addEventListener('input', e => saveSwitching({ corner_deadzone: Number(e.target.value) }));
+document.getElementById('mappingSeg').addEventListener('click', e => {
+  const mapping = e.target.dataset?.mapping;
+  if (mapping) saveSwitching({ edge_mapping: mapping });
+});
+document.getElementById('hotkeyMods').addEventListener('change', e => saveSwitching({ hotkey_modifiers: e.target.value.split(',') }));
+
+document.getElementById('lockBtn').addEventListener('click', async () => {
+  try { await api('PUT', '/api/lock', { locked: !state.edge_locked }); refresh(); }
+  catch (err) { toast(err.message); }
+});
+
+// ------------------------------------------------------------ 单台设备设置
+
+function selectDevice(id) {
+  selectedId = selectedId === id ? null : id;
+  editorFor = null;
+  render();
+}
+
+let editorFor = null;
+
+function renderEditor() {
+  const box = document.getElementById('deviceEditor');
+  const dev = state.devices.find(d => d.id === selectedId && !d.is_host);
+  box.hidden = !dev;
+  if (!dev) return;
+  // 每台设备只构建一次，之后只更新数值，拖动滑块时不会被刷新打断
+  if (editorFor !== dev.id) {
+    editorFor = dev.id;
+    box.innerHTML = `
+      <h2>设备设置</h2>
+      <div class="field" style="margin-top:0">
+        <div class="head"><span>名称</span></div>
+        <input type="text" id="edName" maxlength="40">
+      </div>
+      <label class="toggle field"><input type="checkbox" id="edEnabled"><span>启用这台设备<br><span class="muted">停用后不参与切屏，配置和布局都保留</span></span></label>
+      <div class="field">
+        <div class="head"><span>指针速度</span><span class="val" id="edPointerVal"></span></div>
+        <input type="range" id="edPointer" min="0.25" max="3" step="0.05">
+      </div>
+      <div class="field">
+        <div class="head"><span>滚轮速度</span><span class="val" id="edScrollVal"></span></div>
+        <input type="range" id="edScroll" min="0.25" max="5" step="0.05">
+      </div>
+      <label class="toggle field"><input type="checkbox" id="edInvY"><span>反转纵向滚动<br><span class="muted">控制这台设备时，上下滚动方向相反</span></span></label>
+      <label class="toggle field"><input type="checkbox" id="edInvX"><span>反转横向滚动</span></label>
+      <button id="edReset">恢复默认</button>`;
+    const s = () => state.devices.find(d => d.id === editorFor).settings;
+    const bind = (id, ev, fn) => document.getElementById(id).addEventListener(ev, fn);
+    bind('edName', 'change', e => savePeer({ name: e.target.value }));
+    bind('edEnabled', 'change', e => savePeer({ settings: { ...s(), enabled: e.target.checked } }));
+    bind('edPointer', 'input', e => savePeer({ settings: { ...s(), pointer_speed: Number(e.target.value) } }));
+    bind('edScroll', 'input', e => savePeer({ settings: { ...s(), scroll_speed: Number(e.target.value) } }));
+    bind('edInvY', 'change', e => savePeer({ settings: { ...s(), invert_scroll_y: e.target.checked } }));
+    bind('edInvX', 'change', e => savePeer({ settings: { ...s(), invert_scroll_x: e.target.checked } }));
+    bind('edReset', 'click', () => savePeer({ settings: { enabled: s().enabled, pointer_speed: 1, scroll_speed: 1, invert_scroll_y: false, invert_scroll_x: false } }));
+  }
+  const st = dev.settings;
+  setValue(document.getElementById('edName'), dev.name);
+  setValue(document.getElementById('edEnabled'), st.enabled);
+  setValue(document.getElementById('edPointer'), st.pointer_speed);
+  setValue(document.getElementById('edScroll'), st.scroll_speed);
+  setValue(document.getElementById('edInvY'), st.invert_scroll_y);
+  setValue(document.getElementById('edInvX'), st.invert_scroll_x);
+  document.getElementById('edPointerVal').textContent = `${st.pointer_speed.toFixed(2)}×`;
+  document.getElementById('edScrollVal').textContent = `${st.scroll_speed.toFixed(2)}×`;
+}
+
+let peerTimer;
+function savePeer(patch) {
+  const dev = state.devices.find(d => d.id === editorFor);
+  if (!dev) return;
+  if (patch.settings) dev.settings = patch.settings;
+  if (patch.name) dev.name = patch.name;
+  renderEditor();
+  renderList();
+  const id = dev.id;
+  clearTimeout(peerTimer);
+  peerTimer = setTimeout(() => {
+    api('PUT', `/api/peers/${encodeURIComponent(id)}/settings`, { name: dev.name, settings: dev.settings })
+      .catch(err => toast('保存失败：' + err.message));
+  }, 250);
+}
 
 // ------------------------------------------------------------ 杂项
 

@@ -230,6 +230,7 @@ fn add(store: Store, code: &str, name: Option<String>) -> Result<()> {
         name: name.unwrap_or_else(|| format!("设备 {}", addr.id.fmt_short())),
         os: None,
         displays: Vec::new(),
+        settings: Default::default(),
     });
     store.save(&config)?;
     println!("已添加。运行 roam host 后会自动连接。");
@@ -261,7 +262,24 @@ async fn start_host(
     let url = format!("http://{addr}");
     println!("\nRoam 主机 · {}", host.config.lock().unwrap().name);
     println!("布局页面: {url}");
-    println!("逃生热键: Ctrl + Option + Cmd + Esc（强制回到本机）\n");
+    let combo = host
+        .config
+        .lock()
+        .unwrap()
+        .switching
+        .hotkey_modifiers
+        .iter()
+        .map(|m| match m {
+            roam_core::settings::Modifier::Shift => "Shift",
+            roam_core::settings::Modifier::Ctrl => "Ctrl",
+            roam_core::settings::Modifier::Alt => "Option",
+            roam_core::settings::Modifier::Cmd => "Cmd",
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    println!(
+        "快捷键: {combo} + Esc 回到本机，{combo} + 数字 切到对应设备，{combo} + L 锁定当前屏幕\n"
+    );
     if !no_browser {
         open_browser(&url);
     }

@@ -84,6 +84,12 @@ impl DeviceGeom {
             .unwrap_or((gx, gy))
     }
 
+    /// 离全局点最近的显示器（全局坐标）。
+    pub fn nearest_display_global(&self, gx: f64, gy: f64) -> Option<Rect> {
+        self.global_displays()
+            .min_by(|a, b| a.distance(gx, gy).total_cmp(&b.distance(gx, gy)))
+    }
+
     pub fn distance_global(&self, gx: f64, gy: f64) -> f64 {
         self.global_displays()
             .map(|d| d.distance(gx, gy))
