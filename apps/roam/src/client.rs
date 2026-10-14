@@ -9,12 +9,14 @@ use anyhow::{Result, bail};
 use iroh::endpoint::Connection;
 use roam_core::{config::Store, net::selected_path, ticket};
 use roam_input::Injector;
-use roam_proto::{ClipboardData, ClipboardPolicy, Datagram, Hello, Os, StreamMsg, side};
+use roam_proto::{ClipboardPolicy, Datagram, Hello, Os, StreamMsg};
 
 use crate::{
-    clipboard,
     conn::{self, read_msg, write_msg},
-    dialog, discovery, pairing,
+    dialog, discovery,
+    files::{Transfers, human_bytes},
+    pairing,
+    sync::{self, Inbound, LastDigest},
     tray::{self, TrayHandle},
 };
 
@@ -26,7 +28,7 @@ pub async fn run(store: Store, tray: Option<TrayHandle>) -> Result<()> {
     roam_input::windows::init_dpi();
 
     let config = store.load()?;
-    let endpoint = conn::bind(&store).await?;
+    let endpoint = conn::bind(&store, Some(conn::CLIENT_PORT)).await?;
     let my_id = endpoint.id().to_string();
     let code = ticket::encode(&endpoint.addr())?;
     std::fs::write(store.dir().join("ticket.txt"), &code)?;
@@ -50,6 +52,7 @@ pub async fn run(store: Store, tray: Option<TrayHandle>) -> Result<()> {
     status.waiting();
 
     let injector = Arc::new(Mutex::new(Injector::new()));
+    let transfers = Transfers::default();
     // 同一时间只弹一个授权窗口
     let prompt_lock = Arc::new(tokio::sync::Mutex::new(()));
 
@@ -58,6 +61,8 @@ pub async fn run(store: Store, tray: Option<TrayHandle>) -> Result<()> {
         let injector = injector.clone();
         let prompt_lock = prompt_lock.clone();
         let status = status.clone();
+        let transfers = transfers.clone();
+        let endpoint_addr = endpoint.addr();
         let my_id = my_id.clone();
         let name = config.name.clone();
         tokio::spawn(async move {
@@ -68,12 +73,31 @@ pub async fn run(store: Store, tray: Option<TrayHandle>) -> Result<()> {
                     return;
                 }
             };
+            // 更新通道：只接受已授权主机推送的新版本
+            if conn.alpn() == roam_proto::UPDATE_ALPN {
+                let host_id = conn.remote_id().to_string();
+                let trusted = store
+                    .load()
+                    .map(|c| c.trusted_hosts.contains(&host_id))
+                    .unwrap_or(false);
+                status.set("正在接收新版本…".into());
+                injector.lock().unwrap().release_all();
+                if let Err(err) =
+                    crate::update::receive(conn, trusted, store.dir().to_path_buf()).await
+                {
+                    eprintln!("更新失败: {err:#}");
+                    status.waiting();
+                }
+                return;
+            }
             let ctx = SessionCtx {
                 store,
                 my_id,
                 name,
                 prompt_lock,
                 status: status.clone(),
+                transfers: transfers.clone(),
+                ticket: ticket::encode(&endpoint_addr).unwrap_or_default(),
             };
             if let Err(err) = session(conn, injector.clone(), ctx).await {
                 eprintln!("会话结束: {err:#}");
@@ -91,6 +115,8 @@ struct SessionCtx {
     name: String,
     prompt_lock: Arc<tokio::sync::Mutex<()>>,
     status: Status,
+    transfers: Transfers,
+    ticket: String,
 }
 
 /// 已信任的主机直接放行；陌生主机弹窗询问，并显示校验码供核对。
@@ -140,6 +166,8 @@ async fn session(conn: Connection, injector: Arc<Mutex<Injector>>, ctx: SessionC
             name: ctx.name.clone(),
             os: Os::current(),
             displays: roam_input::displays(),
+            version: roam_proto::VERSION.into(),
+            ticket: ctx.ticket.clone(),
         }),
     )
     .await?;
@@ -150,6 +178,7 @@ async fn session(conn: Connection, injector: Arc<Mutex<Injector>>, ctx: SessionC
     // 连接刚建立时通常先走中继，打洞成功后切到直连；定期刷新托盘状态
     let path_conn = conn.clone();
     let path_status = ctx.status.clone();
+    let path_transfers = ctx.transfers.clone();
     let host_name = host.name.clone();
     let path_task = tokio::spawn(async move {
         let mut last = None;
@@ -160,18 +189,46 @@ async fn session(conn: Connection, injector: Arc<Mutex<Injector>>, ctx: SessionC
                     println!("  路径 → {} {addr}", kind.label());
                     last = Some(*kind);
                 }
-                path_status.connected(&host_name, kind.label(), rtt.as_secs_f64() * 1000.0);
+                let transfer = path_transfers.active().map(|t| {
+                    let pct = (t.done * 100).checked_div(t.total).unwrap_or(100);
+                    let arrow = if t.direction == "send" {
+                        "发送"
+                    } else {
+                        "接收"
+                    };
+                    format!("{arrow}「{}」{pct}%（{}）", t.title, human_bytes(t.total))
+                });
+                path_status.connected(
+                    &host_name,
+                    kind.label(),
+                    rtt.as_secs_f64() * 1000.0,
+                    transfer,
+                );
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 
-    // 剪贴板：主机发来的内容写入本机；光标离开时把本机剪贴板发回主机
-    let clip = ClipState::default();
+    // 剪贴板与文件：主机发来的内容写入本机；光标离开时把本机剪贴板发回主机。
+    // 老版本主机不会下发策略，默认不同步。
+    let policy = Arc::new(Mutex::new(ClipboardPolicy::default()));
+    let last = LastDigest::default();
     let side_task = {
-        let conn = conn.clone();
-        let clip = clip.clone();
-        tokio::spawn(async move { receive_side(conn, clip).await })
+        let ctx = Inbound {
+            peer: host.name.clone(),
+            policy: {
+                let policy = policy.clone();
+                Arc::new(move || *policy.lock().unwrap())
+            },
+            on_policy: {
+                let policy = policy.clone();
+                Some(Arc::new(move |p| *policy.lock().unwrap() = p))
+            },
+            last: last.clone(),
+            transfers: ctx.transfers.clone(),
+            on_updated: Arc::new(|| {}),
+        };
+        tokio::spawn(sync::receive_loop(conn.clone(), ctx))
     };
 
     // 鼠标移动走数据报，单独一个任务处理
@@ -204,8 +261,16 @@ async fn session(conn: Connection, injector: Arc<Mutex<Injector>>, ctx: SessionC
             };
             if matches!(msg, StreamMsg::Leave) {
                 let conn = conn.clone();
-                let clip = clip.clone();
-                tokio::spawn(async move { send_clipboard(&conn, &clip).await });
+                let policy = *policy.lock().unwrap();
+                let last = last.clone();
+                let transfers = ctx.transfers.clone();
+                let host_name = host.name.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = sync::push(&conn, policy, &last, &host_name, &transfers).await
+                    {
+                        eprintln!("同步到主机失败: {err:#}");
+                    }
+                });
             }
             {
                 let mut inj = injector.lock().unwrap();
@@ -236,68 +301,6 @@ async fn session(conn: Connection, injector: Arc<Mutex<Injector>>, ctx: SessionC
     result
 }
 
-/// 剪贴板同步状态（每个会话一份）。
-#[derive(Clone, Default)]
-struct ClipState {
-    /// 主机下发的策略；老版本主机不会下发，默认不同步。
-    policy: Arc<Mutex<ClipboardPolicy>>,
-    /// 最近一次收到或发出的内容摘要，没变就不重复发送。
-    last_digest: Arc<Mutex<Option<u64>>>,
-}
-
-async fn receive_side(conn: Connection, clip: ClipState) {
-    while let Ok(mut stream) = conn.accept_uni().await {
-        let max = clip.policy.lock().unwrap().max_bytes.max(64 * 1024) + 1024;
-        let Ok((kind, body)) = clipboard::read_side(&mut stream, max).await else {
-            continue;
-        };
-        match kind {
-            side::CLIPBOARD_POLICY => {
-                if let Ok(policy) = clipboard::decode::<ClipboardPolicy>(&body) {
-                    *clip.policy.lock().unwrap() = policy;
-                }
-            }
-            side::CLIPBOARD => {
-                if !clip.policy.lock().unwrap().enabled {
-                    continue;
-                }
-                let Ok(data) = clipboard::decode::<ClipboardData>(&body) else {
-                    continue;
-                };
-                let digest = data.digest();
-                println!("  剪贴板 ← 主机（{} 字节）", data.size());
-                let written = tokio::task::spawn_blocking(move || clipboard::write(&data)).await;
-                if matches!(written, Ok(Ok(()))) {
-                    *clip.last_digest.lock().unwrap() = Some(digest);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-async fn send_clipboard(conn: &Connection, clip: &ClipState) {
-    let policy = *clip.policy.lock().unwrap();
-    if !policy.enabled {
-        return;
-    }
-    let Ok(Some(data)) = tokio::task::spawn_blocking(move || clipboard::read(&policy)).await else {
-        return;
-    };
-    let digest = data.digest();
-    if *clip.last_digest.lock().unwrap() == Some(digest) {
-        return;
-    }
-    let size = data.size();
-    match clipboard::send_side(conn, side::CLIPBOARD, &data).await {
-        Ok(()) => {
-            println!("  剪贴板 → 主机（{size} 字节）");
-            *clip.last_digest.lock().unwrap() = Some(digest);
-        }
-        Err(err) => eprintln!("同步剪贴板失败: {err:#}"),
-    }
-}
-
 /// 被控端状态，同步到托盘。
 #[derive(Clone)]
 struct Status {
@@ -313,17 +316,21 @@ impl Status {
         self.set("等待主机连接".into());
     }
 
-    fn connected(&self, host: &str, path: &str, rtt_ms: f64) {
-        self.set(format!("已连接「{host}」· {path} · {rtt_ms:.1} ms"));
+    fn connected(&self, host: &str, path: &str, rtt_ms: f64, transfer: Option<String>) {
+        match transfer {
+            Some(t) => self.set(format!("已连接「{host}」· {t}")),
+            None => self.set(format!("已连接「{host}」· {path} · {rtt_ms:.1} ms")),
+        }
     }
 
     fn set(&self, status: String) {
         if let Some(tray) = &self.tray {
             tray.update(tray::State {
                 title: None,
-                tooltip: format!("Roam 被控端 · {status}"),
+                tooltip: format!("Roam 被控端 v{} · {status}", roam_proto::VERSION),
                 status,
                 paused: false,
+                update_label: None,
             });
         }
     }

@@ -18,15 +18,18 @@ use roam_core::{
     router::{CursorControl, Outbound, PeerLink, Router},
     ticket,
 };
-use roam_proto::{ALPN, ClipboardData, ClipboardPolicy, DisplayInfo, Hello, Os, StreamMsg, side};
+use roam_proto::{ALPN, ClipboardPolicy, DisplayInfo, Hello, Os, StreamMsg, side};
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::{
     clipboard,
     conn::{read_msg, write_msg},
     discovery::{self, Nearby},
+    files::Transfers,
     pairing,
+    sync::{self, Inbound, LastDigest},
     tray::{self, TrayHandle},
+    update::{self, Updater},
 };
 
 /// 被控端拒绝授权时关闭连接用的错误码。
@@ -55,6 +58,8 @@ pub struct PeerStatus {
     pub pending_code: Option<String>,
     /// 被拒绝后停止重连，等用户手动重试。
     pub denied: bool,
+    /// 对方的程序版本。
+    pub version: Option<String>,
 }
 
 pub struct Host {
@@ -74,7 +79,12 @@ pub struct Host {
     /// 在线设备的连接（剪贴板同步用）。
     conns: Mutex<HashMap<String, Connection>>,
     /// 每台设备上次同步的剪贴板摘要，没变就不重复发送。
-    clip_digest: Mutex<HashMap<String, u64>>,
+    clip_digest: Mutex<HashMap<String, LastDigest>>,
+    /// 文件传输进度。
+    pub transfers: Transfers,
+    pub updater: Updater,
+    /// 正在执行更新，防止重复点击。
+    updating: Mutex<bool>,
     _mdns: Option<mdns_sd::ServiceDaemon>,
     me: Mutex<std::sync::Weak<Host>>,
 }
@@ -87,6 +97,7 @@ impl Host {
     ) -> Result<Arc<Self>> {
         let config = store.load()?;
         let host_id = endpoint.id().to_string();
+        let updater = Updater::new(&endpoint, store.dir().join("updates"))?;
         let nearby = Nearby::default();
         let mdns = match discovery::browse(nearby.clone()) {
             Ok(daemon) => Some(daemon),
@@ -110,6 +121,9 @@ impl Host {
             tasks: Mutex::new(HashMap::new()),
             conns: Mutex::new(HashMap::new()),
             clip_digest: Mutex::new(HashMap::new()),
+            transfers: Transfers::default(),
+            updater,
+            updating: Mutex::new(false),
             _mdns: mdns,
             me: Mutex::new(std::sync::Weak::new()),
         });
@@ -134,6 +148,15 @@ impl Host {
         for peer in peers {
             self.spawn_peer(peer);
         }
+        let host = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            loop {
+                let _ = host.updater.check().await;
+                tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+            }
+        });
+
         // 光标切到某台设备时，把主机剪贴板同步过去
         let host = self.clone();
         tokio::spawn(async move {
@@ -197,11 +220,20 @@ impl Host {
             (Some(name), _) => Some(format!("→ {name}")),
             (None, _) => None,
         };
+        let update_label = {
+            let u = self.updater.state.lock().unwrap();
+            match (&u.phase, &u.latest) {
+                (Some(phase), _) => Some(phase.clone()),
+                (None, Some(r)) if u.available => Some(format!("更新到 v{}", r.version)),
+                _ => None,
+            }
+        };
         tray::State {
             title,
-            tooltip: format!("Roam · {status}"),
+            tooltip: format!("Roam v{} · {status}", roam_proto::VERSION),
             status,
             paused,
+            update_label,
         }
     }
 
@@ -394,6 +426,8 @@ impl Host {
                 name,
                 os: Os::current(),
                 displays: self.displays.clone(),
+                version: roam_proto::VERSION.into(),
+                ticket: String::new(),
             }),
         )
         .await?;
@@ -439,6 +473,11 @@ impl Host {
                 }
                 p.os = Some(hello.os);
                 p.displays = hello.displays.clone();
+                if !hello.ticket.is_empty()
+                    && ticket::decode(&hello.ticket).is_ok_and(|a| a.id.to_string() == p.id)
+                {
+                    p.ticket = hello.ticket.clone();
+                }
             }
         }
         self.save_config()?;
@@ -448,7 +487,7 @@ impl Host {
             .lock()
             .unwrap()
             .add_peer(peer.id.clone(), PeerLink { os: hello.os, tx });
-        self.update_status(&peer.id, &conn);
+        self.update_status(&peer.id, &conn, &hello.version);
         self.rebuild_world();
         tracing::info!("已连接 {}", hello.name);
 
@@ -456,16 +495,41 @@ impl Host {
             .lock()
             .unwrap()
             .insert(peer.id.clone(), conn.clone());
-        self.clip_digest.lock().unwrap().remove(&peer.id);
+        self.clip_digest
+            .lock()
+            .unwrap()
+            .insert(peer.id.clone(), LastDigest::default());
         let policy = self.clipboard_policy(&peer.id);
         if let Err(err) = clipboard::send_side(&conn, side::CLIPBOARD_POLICY, &policy).await {
             tracing::warn!("发送剪贴板策略失败: {err:#}");
         }
         let side_task = {
             let host = self.this();
-            let conn = conn.clone();
             let id = peer.id.clone();
-            tokio::spawn(async move { host.receive_side(id, conn).await })
+            let rt = tokio::runtime::Handle::current();
+            let ctx = Inbound {
+                peer: hello.name.clone(),
+                policy: {
+                    let host = host.clone();
+                    let id = id.clone();
+                    Arc::new(move || host.clipboard_policy(&id))
+                },
+                on_policy: None,
+                last: self.last_digest(&id),
+                transfers: self.transfers.clone(),
+                // 对方的内容进了主机剪贴板；如果光标已经去了另一台设备，顺手转发过去
+                on_updated: Arc::new(move || {
+                    let host = host.clone();
+                    let id = id.clone();
+                    rt.spawn(async move {
+                        let focused = host.router.lock().unwrap().focused().map(str::to_string);
+                        if let Some(other) = focused.filter(|f| *f != id) {
+                            host.sync_clipboard_to(&other).await;
+                        }
+                    });
+                }),
+            };
+            tokio::spawn(sync::receive_loop(conn.clone(), ctx))
         };
 
         // 被控端只会回 Pong，后台读掉即可
@@ -486,7 +550,7 @@ impl Host {
                         }
                     }
                 }
-                _ = status_tick.tick() => self.update_status(&peer.id, &conn),
+                _ = status_tick.tick() => self.update_status(&peer.id, &conn, &hello.version),
                 reason = conn.closed() => break Err(anyhow::anyhow!("连接断开: {reason}")),
             }
         };
@@ -518,6 +582,8 @@ impl Host {
             enabled: config.clipboard.enabled && per_device,
             images: config.clipboard.images,
             max_bytes: config.clipboard.max_bytes(),
+            files: config.clipboard.files,
+            max_file_bytes: config.clipboard.max_file_bytes(),
         }
     }
 
@@ -538,71 +604,179 @@ impl Host {
         }
     }
 
-    /// 把主机剪贴板发给某台设备（内容没变就跳过）。
+    fn last_digest(&self, id: &str) -> LastDigest {
+        self.clip_digest
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// 把主机剪贴板（文本、图片或文件）发给某台设备，内容没变就跳过。
     async fn sync_clipboard_to(&self, id: &str) {
         let policy = self.clipboard_policy(id);
-        if !policy.enabled {
-            return;
-        }
         let Some(conn) = self.conns.lock().unwrap().get(id).cloned() else {
             return;
         };
-        let Ok(Some(data)) = tokio::task::spawn_blocking(move || clipboard::read(&policy)).await
-        else {
-            return;
+        let name = self
+            .config
+            .lock()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| short_id(id).to_string());
+        let last = self.last_digest(id);
+        if let Err(err) = sync::push(&conn, policy, &last, &name, &self.transfers).await {
+            tracing::warn!("同步到「{name}」失败: {err:#}");
+        }
+    }
+
+    // ------------------------------------------------------------ 更新
+
+    fn mirror(&self) -> Option<String> {
+        self.config.lock().unwrap().update_mirror.clone()
+    }
+
+    /// 一键更新：先把新版本推给所有被控端，再更新主机自己并重启。
+    pub async fn update_all(self: Arc<Self>) -> Result<()> {
+        {
+            let mut updating = self.updating.lock().unwrap();
+            if *updating {
+                bail!("正在更新中");
+            }
+            *updating = true;
+        }
+        let result = self.clone().update_all_inner().await;
+        *self.updating.lock().unwrap() = false;
+        if let Err(err) = &result {
+            self.updater.set_phase(None);
+            self.updater.set_error(Some(format!("更新失败：{err:#}")));
+        }
+        result
+    }
+
+    async fn update_all_inner(self: Arc<Self>) -> Result<()> {
+        self.updater.set_error(None);
+        self.updater.state.lock().unwrap().devices.clear();
+        if self.updater.state.lock().unwrap().latest.is_none() {
+            self.updater.set_phase(Some("正在检查更新…".into()));
+            self.updater.check().await?;
+        }
+        let (release, available) = {
+            let state = self.updater.state.lock().unwrap();
+            (
+                state.latest.clone().context("没有可用的版本")?,
+                state.available,
+            )
         };
-        let digest = data.digest();
-        if self.clip_digest.lock().unwrap().get(id) == Some(&digest) {
-            return;
+        if !available {
+            bail!("已经是最新版本");
         }
-        let size = data.size();
-        match clipboard::send_side(&conn, side::CLIPBOARD, &data).await {
-            Ok(()) => {
-                tracing::info!("剪贴板 → {}（{size} 字节）", short_id(id));
-                self.clip_digest
-                    .lock()
-                    .unwrap()
-                    .insert(id.to_string(), digest);
+        let mirror = self.mirror();
+
+        // 先下载本机的安装包，确保主机自己能更新成功再动被控端
+        let own = self
+            .updater
+            .fetch(&release, Os::current(), mirror.as_deref())
+            .await?;
+
+        let peers: Vec<Peer> = self
+            .config
+            .lock()
+            .unwrap()
+            .peers
+            .iter()
+            .filter(|p| p.settings.enabled)
+            .cloned()
+            .collect();
+        for peer in peers {
+            let current = self
+                .status
+                .lock()
+                .unwrap()
+                .get(&peer.id)
+                .and_then(|s| s.version.clone());
+            if current.as_deref() == Some(release.version.as_str()) {
+                self.record_update(&peer.name, "已是最新");
+                continue;
             }
-            Err(err) => tracing::warn!("同步剪贴板失败: {err:#}"),
+            let result = self.push_release(&peer, &release, mirror.as_deref()).await;
+            self.record_update(
+                &peer.name,
+                &match result {
+                    Ok(()) => "已更新".to_string(),
+                    Err(err) => format!("{err:#}"),
+                },
+            );
         }
+
+        self.updater.set_phase(Some(format!(
+            "正在更新本机到 v{}，马上重启…",
+            release.version
+        )));
+        self.router.lock().unwrap().return_home();
+        update::install(&own)?;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        update::restart();
     }
 
-    /// 接收被控端发来的单向流（目前只有剪贴板）。
-    async fn receive_side(self: Arc<Self>, id: String, conn: Connection) {
-        while let Ok(mut stream) = conn.accept_uni().await {
-            let policy = self.clipboard_policy(&id);
-            let (kind, body) =
-                match clipboard::read_side(&mut stream, policy.max_bytes + 1024).await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        tracing::warn!("接收失败: {err:#}");
-                        continue;
-                    }
-                };
-            if kind != side::CLIPBOARD || !policy.enabled {
-                continue;
-            }
-            let Ok(data) = clipboard::decode::<ClipboardData>(&body) else {
-                continue;
-            };
-            let digest = data.digest();
-            tracing::info!("剪贴板 ← {}（{} 字节）", short_id(&id), data.size());
-            let written = tokio::task::spawn_blocking(move || clipboard::write(&data)).await;
-            if !matches!(written, Ok(Ok(()))) {
-                tracing::warn!("写入剪贴板失败");
-                continue;
-            }
-            self.clip_digest.lock().unwrap().insert(id.clone(), digest);
-            // 光标已经去了另一台设备：顺手转发过去
-            let focused = self.router.lock().unwrap().focused().map(str::to_string);
-            if let Some(other) = focused.filter(|f| *f != id) {
-                self.sync_clipboard_to(&other).await;
-            }
-        }
+    fn record_update(&self, name: &str, result: &str) {
+        tracing::info!("更新「{name}」: {result}");
+        self.updater
+            .state
+            .lock()
+            .unwrap()
+            .devices
+            .push((name.to_string(), result.to_string()));
     }
 
-    fn update_status(&self, id: &str, conn: &iroh::endpoint::Connection) {
+    async fn push_release(
+        &self,
+        peer: &Peer,
+        release: &update::Release,
+        mirror: Option<&str>,
+    ) -> Result<()> {
+        // 不知道对方系统时（从没连上过）按 Windows 处理，目前被控端只有 Windows
+        let os = peer.os.unwrap_or(Os::Windows);
+        let bin = self.updater.fetch(release, os, mirror).await?;
+        self.updater
+            .set_phase(Some(format!("正在推送到「{}」…", peer.name)));
+        let addr = ticket::decode(&peer.ticket)?;
+        update::push(&self.endpoint, addr, &bin, &release.version).await
+    }
+
+    /// 把一台版本不一致的设备同步到主机当前的版本。
+    pub async fn sync_version(self: Arc<Self>, id: String) -> Result<()> {
+        let peer = self
+            .config
+            .lock()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .context("没有这台设备")?;
+        self.updater.set_error(None);
+        let result = async {
+            let release = self.updater.release_for(roam_proto::VERSION).await?;
+            self.push_release(&peer, &release, self.mirror().as_deref())
+                .await
+        }
+        .await;
+        self.updater.set_phase(None);
+        match &result {
+            Ok(()) => self.record_update(&peer.name, "已同步"),
+            Err(err) => self
+                .updater
+                .set_error(Some(format!("同步「{}」失败：{err:#}", peer.name))),
+        }
+        result
+    }
+
+    fn update_status(&self, id: &str, conn: &iroh::endpoint::Connection, version: &str) {
         let path = selected_path(conn);
         self.status.lock().unwrap().insert(
             id.to_string(),
@@ -610,6 +784,7 @@ impl Host {
                 online: true,
                 path: path.as_ref().map(|p| p.0),
                 rtt_ms: path.map(|p| p.2.as_secs_f64() * 1000.0),
+                version: Some(version.to_string()),
                 ..Default::default()
             },
         );

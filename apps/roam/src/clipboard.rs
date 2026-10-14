@@ -6,7 +6,7 @@
 use std::{borrow::Cow, io::Cursor, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use iroh::endpoint::{Connection, RecvStream};
+use iroh::endpoint::Connection;
 use roam_proto::{ClipboardData, ClipboardPolicy, encode_side};
 use serde::de::DeserializeOwned;
 
@@ -103,19 +103,6 @@ pub async fn send_side(conn: &Connection, kind: u8, body: &impl serde::Serialize
         .context("发送剪贴板超时")??;
     stream.finish()?;
     Ok(())
-}
-
-/// 读取单向流：返回类型和原始内容。
-pub async fn read_side(stream: &mut RecvStream, max_bytes: u64) -> Result<(u8, Vec<u8>)> {
-    let mut head = [0u8; 5];
-    stream.read_exact(&mut head).await?;
-    let len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as u64;
-    if len > max_bytes {
-        bail!("数据过大（{len} 字节），已忽略");
-    }
-    let mut body = vec![0u8; len as usize];
-    stream.read_exact(&mut body).await?;
-    Ok((head[0], body))
 }
 
 pub fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T> {

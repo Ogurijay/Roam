@@ -58,6 +58,9 @@ pub struct Config {
     /// 剪贴板同步。
     #[serde(default)]
     pub clipboard: ClipboardSettings,
+    /// 下载更新时加在 GitHub 地址前的镜像前缀（国内加速用），例如 `https://ghfast.top/`。
+    #[serde(default)]
+    pub update_mirror: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -74,6 +77,7 @@ impl Config {
             swap_cmd_ctrl: true,
             switching: SwitchSettings::default(),
             clipboard: ClipboardSettings::default(),
+            update_mirror: None,
         }
     }
 

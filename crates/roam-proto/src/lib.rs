@@ -10,7 +10,13 @@
 use serde::{Deserialize, Serialize};
 
 /// ALPN，协议不兼容时递增版本号。
-pub const ALPN: &[u8] = b"roam/1";
+pub const ALPN: &[u8] = b"roam/2";
+
+/// 更新通道的 ALPN。永远保持兼容：即使主协议升级了，主机也能用它把新版本推给旧客户端。
+pub const UPDATE_ALPN: &[u8] = b"roam/update/1";
+
+/// 本程序版本（工作区版本号）。
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Os {
@@ -58,6 +64,10 @@ pub struct Hello {
     pub name: String,
     pub os: Os,
     pub displays: Vec<DisplayInfo>,
+    /// 程序版本，用于提示和同步更新。
+    pub version: String,
+    /// 被控端当前的连接码（地址可能变化，主机据此更新保存的连接码）；主机发送时为空。
+    pub ticket: String,
 }
 
 /// 鼠标按键。
@@ -225,6 +235,8 @@ mod tests {
                 },
                 scale: 2.0,
             }],
+            version: VERSION.into(),
+            ticket: String::new(),
         });
         let frame = msg.encode_frame().unwrap();
         let len = u16::from_be_bytes([frame[0], frame[1]]) as usize;
@@ -240,6 +252,10 @@ mod tests {
 pub mod side {
     pub const CLIPBOARD: u8 = 1;
     pub const CLIPBOARD_POLICY: u8 = 2;
+    /// 文件清单：[`FileOffer`](super::FileOffer)。
+    pub const FILE_OFFER: u8 = 3;
+    /// 单个文件：头部是 [`FileDataHeader`](super::FileDataHeader)，之后直到流结束都是文件内容。
+    pub const FILE_DATA: u8 = 4;
 }
 
 /// 剪贴板内容。有文本时只同步文本（和富文本），没有文本时才同步图片。
@@ -277,6 +293,59 @@ pub struct ClipboardPolicy {
     pub enabled: bool,
     pub images: bool,
     pub max_bytes: u64,
+    /// 复制文件后切屏时传输文件。
+    pub files: bool,
+    /// 单次文件传输的总大小上限。
+    pub max_file_bytes: u64,
+}
+
+/// 一次文件传输的清单（复制的所有文件和文件夹）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOffer {
+    pub transfer_id: u64,
+    pub entries: Vec<FileEntry>,
+}
+
+impl FileOffer {
+    pub fn total_bytes(&self) -> u64 {
+        self.entries.iter().map(|e| e.size).sum()
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.entries.iter().filter(|e| !e.is_dir).count()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// 相对路径，用 `/` 分隔；第一段是复制时选中的文件或文件夹名。
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDataHeader {
+    pub transfer_id: u64,
+    /// 在 [`FileOffer::entries`] 中的下标。
+    pub index: u32,
+}
+
+// ---------------------------------------------------------------- 更新通道
+
+/// 主机推送新版本：先发这个头部，之后是完整的程序文件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateOffer {
+    pub version: String,
+    pub size: u64,
+    pub sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateReply {
+    /// 已校验并替换，马上重启。
+    Installed,
+    Rejected(String),
 }
 
 pub fn encode_side(kind: u8, body: &impl Serialize) -> Result<Vec<u8>, Error> {

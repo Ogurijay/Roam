@@ -112,6 +112,10 @@ pub struct ClipboardSettings {
     pub images: bool,
     /// 单次同步的大小上限（MB），超过就不同步。
     pub max_mb: u32,
+    /// 复制文件后切屏时传输文件。
+    pub files: bool,
+    /// 单次文件传输的总大小上限（MB）。
+    pub max_file_mb: u32,
 }
 
 impl Default for ClipboardSettings {
@@ -120,6 +124,8 @@ impl Default for ClipboardSettings {
             enabled: true,
             images: true,
             max_mb: 20,
+            files: true,
+            max_file_mb: 4096,
         }
     }
 }
@@ -127,7 +133,12 @@ impl Default for ClipboardSettings {
 impl ClipboardSettings {
     pub fn sanitized(mut self) -> Self {
         self.max_mb = self.max_mb.clamp(1, 200);
+        self.max_file_mb = self.max_file_mb.clamp(1, 100 * 1024);
         self
+    }
+
+    pub fn max_file_bytes(&self) -> u64 {
+        self.max_file_mb as u64 * 1024 * 1024
     }
 
     pub fn max_bytes(&self) -> u64 {

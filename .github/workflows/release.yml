@@ -1,0 +1,86 @@
+# 打 v* 标签时自动构建并发布安装包，程序内的更新功能从这里下载。
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# 标签版本必须和 Cargo.toml 的 workspace 版本一致。
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            asset: roam-windows-x86_64.exe
+          - os: macos-latest
+            asset: roam-macos-universal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查版本号
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "标签 ${GITHUB_REF_NAME} 与 Cargo.toml 版本 $version 不一致"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || 'x86_64-pc-windows-msvc' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 测试
+        run: cargo test --workspace --release
+
+      - name: 构建（Windows）
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          cargo build --release -p roam --target x86_64-pc-windows-msvc
+          cp target/x86_64-pc-windows-msvc/release/roam.exe ${{ matrix.asset }}
+
+      - name: 构建（macOS 通用版）
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo build --release -p roam --target aarch64-apple-darwin
+          cargo build --release -p roam --target x86_64-apple-darwin
+          lipo -create -output ${{ matrix.asset }} \
+            target/aarch64-apple-darwin/release/roam \
+            target/x86_64-apple-darwin/release/roam
+          codesign --force --sign - ${{ matrix.asset }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -202,6 +202,22 @@
   .device.selected .screen { outline: 2px solid var(--accent); outline-offset: 3px; }
   #deviceEditor h3 { margin: 0 0 6px; font-size: 14px; }
   .hotkeys { font-size: 12px; color: var(--muted); line-height: 2; }
+  .update-banner {
+    margin: 12px 20px 0; padding: 12px 16px; border-radius: 10px;
+    background: var(--peer-soft); border: 1px solid var(--peer); display: flex; align-items: center; gap: 12px;
+  }
+  .update-banner .body { flex: 1; min-width: 0; }
+  .update-banner details { font-size: 12px; color: var(--muted); margin-top: 4px; white-space: pre-wrap; }
+  .transfer { padding: 8px 0; border-top: 1px solid var(--border); font-size: 13px; }
+  .transfer:first-of-type { border-top: none; padding-top: 0; }
+  .transfer .row { display: flex; justify-content: space-between; gap: 8px; }
+  .transfer .row span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar { height: 4px; border-radius: 2px; background: var(--border); margin-top: 6px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--accent); transition: width .3s; }
+  .transfer.failed .bar > div { background: var(--danger); }
+  .transfer.done .bar > div { background: var(--ok); }
+  .ver { font-size: 11px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+  .ver.old { color: var(--warn-text); }
   #toast {
     position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px);
     background: var(--text); color: var(--panel); padding: 8px 14px; border-radius: 8px;
@@ -212,7 +228,7 @@
 </head>
 <body>
 <header>
-  <div class="brand">Roam<small id="hostName"></small></div>
+  <div class="brand">Roam<small id="hostName"></small><small id="hostVer"></small></div>
   <span class="pill" id="capturePill"><span class="dot"></span><span>键鼠采集</span></span>
   <div class="spacer"></div>
   <span class="pill focus" id="focusPill" hidden></span>
@@ -221,6 +237,7 @@
   <button id="pauseBtn" title="暂停后光标不会切到其他设备">暂停切屏</button>
 </header>
 <div class="pairing" id="pairing" hidden></div>
+<div class="update-banner" id="updateBanner" hidden></div>
 <div class="banner" id="banner" hidden></div>
 <main>
   <div id="stage">
@@ -232,6 +249,10 @@
       <div id="deviceList"></div>
     </section>
     <section id="deviceEditor" hidden></section>
+    <section id="transferSection" hidden>
+      <h2>文件传输 <button class="link" id="openDownloads" style="float:right">打开接收文件夹</button></h2>
+      <div id="transferList"></div>
+    </section>
     <section id="nearbySection" hidden>
       <h2>附近的设备</h2>
       <div id="nearbyList"></div>
@@ -298,8 +319,18 @@
       <h2>剪贴板同步</h2>
       <label class="toggle field" style="margin-top:0"><input type="checkbox" id="clipEnabled"><span>切屏时同步剪贴板<br><span class="muted">在一台电脑上复制，切到另一台直接粘贴，双向都可以</span></span></label>
       <label class="toggle field"><input type="checkbox" id="clipImages"><span>同步图片<br><span class="muted">只在复制的内容里没有文字时才同步图片</span></span></label>
+      <label class="toggle field"><input type="checkbox" id="clipFiles"><span>复制文件后切屏时传输文件<br><span class="muted">收到的文件放在「下载/Roam」，传完后直接粘贴即可</span></span></label>
       <div class="field">
-        <div class="head"><span>单次大小上限</span></div>
+        <div class="head"><span>文件传输上限</span></div>
+        <select id="clipFileMax">
+          <option value="1024">1 GB</option>
+          <option value="4096">4 GB</option>
+          <option value="10240">10 GB</option>
+          <option value="51200">50 GB</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="head"><span>文本 / 图片大小上限</span></div>
         <select id="clipMax">
           <option value="5">5 MB</option>
           <option value="20">20 MB</option>
@@ -307,6 +338,18 @@
           <option value="100">100 MB</option>
         </select>
         <div class="desc">超过上限的内容不同步，避免慢速网络下卡顿。</div>
+      </div>
+    </section>
+    <section>
+      <h2>更新</h2>
+      <div class="field" style="margin-top:0">
+        <div class="head"><span id="updInfo"></span></div>
+        <button id="checkUpdate">检查更新</button>
+      </div>
+      <div class="field">
+        <div class="head"><span>下载镜像（可选）</span></div>
+        <input type="text" id="mirror" placeholder="例如 https://ghfast.top/">
+        <div class="desc">从 GitHub 下载很慢时，填一个加速镜像前缀。留空表示直连（会使用系统代理）。</div>
       </div>
     </section>
     <section>
@@ -438,6 +481,8 @@ function render() {
   renderNearby();
   renderSwitching();
   renderClipboard();
+  renderUpdate();
+  renderTransfers();
   renderEditor();
 
   const swap = document.getElementById('swapCmd');
@@ -521,16 +566,19 @@ function renderList() {
     const err = !dev.is_host && !dev.online && dev.error ? `<div class="err">${esc(dev.error)}</div>` : '';
     const retry = !dev.is_host && !dev.online && (dev.denied || dev.error) ? `<button class="link retry" data-retry="${dev.id}">重试</button>` : '';
     const n = deviceNumber(dev);
+    const verOld = !dev.is_host && dev.online && dev.version && dev.version !== state.version;
+    const ver = dev.version ? `<span class="ver ${verOld ? 'old' : ''}">v${esc(dev.version)}</span>` : '';
+    const syncBtn = verOld ? `<button class="link retry" data-syncver="${dev.id}">同步版本</button>` : '';
     const disabled = dev.settings && !dev.settings.enabled;
     return `<div class="item ${dev.is_host ? '' : 'selectable'} ${selectedId === dev.id ? 'selected' : ''}" data-select="${dev.is_host ? '' : dev.id}">
       <span class="num" title="快捷键编号">${n ?? '–'}</span>
       <span class="dot ${dev.online ? 'on' : ''}" style="margin-top:7px"></span>
       <div class="body">
         <div class="title"><span>${esc(dev.name)}</span>
-          <span class="badge ${dev.is_host ? '' : 'peer'}">${dev.is_host ? '主机' : esc(OS_LABEL[dev.os] || '被控')}</span>${disabled ? '<span class="badge" style="background:var(--bg);color:var(--muted)">已停用</span>' : ''}</div>
+          <span class="badge ${dev.is_host ? '' : 'peer'}">${dev.is_host ? '主机' : esc(OS_LABEL[dev.os] || '被控')}</span>${ver}${disabled ? '<span class="badge" style="background:var(--bg);color:var(--muted)">已停用</span>' : ''}</div>
         ${status ? `<div class="sub">${esc(status)}</div>` : ''}${pendingLine}${err}
       </div>
-      ${dev.is_host ? '' : `<div class="actions">${retry}<button class="link" data-remove="${dev.id}">移除</button></div>`}
+      ${dev.is_host ? '' : `<div class="actions">${retry}${syncBtn}<button class="link" data-remove="${dev.id}">移除</button></div>`}
     </div>`;
   }).join(''));
 }
@@ -659,6 +707,12 @@ document.getElementById('addBtn').addEventListener('click', async () => {
 });
 
 document.getElementById('deviceList').addEventListener('click', async e => {
+  const syncId = e.target.dataset?.syncver;
+  if (syncId) {
+    try { await api('POST', `/api/peers/${encodeURIComponent(syncId)}/sync-version`); toast('正在把这台设备同步到主机的版本…'); }
+    catch (err) { toast(err.message); }
+    return;
+  }
   const retryId = e.target.dataset?.retry;
   if (retryId) {
     try { await api('POST', `/api/peers/${encodeURIComponent(retryId)}/retry`); toast('正在重新连接…'); refresh(); }
@@ -808,6 +862,10 @@ function renderClipboard() {
   setValue(document.getElementById('clipEnabled'), c.enabled);
   setValue(document.getElementById('clipImages'), c.images);
   setValue(document.getElementById('clipMax'), String(c.max_mb));
+  setValue(document.getElementById('clipFiles'), c.files);
+  setValue(document.getElementById('clipFileMax'), String(c.max_file_mb));
+  document.getElementById('clipFiles').disabled = !c.enabled;
+  document.getElementById('clipFileMax').disabled = !c.enabled || !c.files;
   document.getElementById('clipImages').disabled = !c.enabled;
   document.getElementById('clipMax').disabled = !c.enabled;
 }
@@ -821,6 +879,95 @@ function saveClipboard(patch) {
 document.getElementById('clipEnabled').addEventListener('change', e => saveClipboard({ enabled: e.target.checked }));
 document.getElementById('clipImages').addEventListener('change', e => saveClipboard({ images: e.target.checked }));
 document.getElementById('clipMax').addEventListener('change', e => saveClipboard({ max_mb: Number(e.target.value) }));
+document.getElementById('clipFiles').addEventListener('change', e => saveClipboard({ files: e.target.checked }));
+document.getElementById('clipFileMax').addEventListener('change', e => saveClipboard({ max_file_mb: Number(e.target.value) }));
+
+// ------------------------------------------------------------ 更新
+
+function fmtTime(sec) {
+  if (!sec) return '尚未检查';
+  const d = new Date(sec * 1000);
+  return `上次检查：${d.toLocaleDateString()} ${d.toLocaleTimeString().slice(0, 5)}`;
+}
+
+function renderUpdate() {
+  const u = state.update;
+  document.getElementById('hostVer').textContent = ` · v${state.version}`;
+  document.getElementById('updInfo').textContent = `当前版本 v${state.version} · ${fmtTime(u.last_checked)}`;
+  setValue(document.getElementById('mirror'), state.update_mirror || '');
+
+  const banner = document.getElementById('updateBanner');
+  const show = u.available || u.phase || u.error || u.devices.length;
+  banner.hidden = !show;
+  if (!show) return;
+  const results = u.devices.length
+    ? `<div class="muted" style="font-size:12px;margin-top:4px">${u.devices.map(([n, r]) => `${esc(n)}：${esc(r)}`).join('；')}</div>` : '';
+  let body, action = '';
+  if (u.phase) {
+    body = `<b>${esc(u.phase)}</b>`;
+  } else if (u.error) {
+    body = `<b style="color:var(--danger)">${esc(u.error)}</b>`;
+    action = u.available ? '<button class="primary" id="applyUpdate">重试</button>' : '';
+  } else if (u.available) {
+    body = `<b>发现新版本 v${esc(u.latest.version)}</b>（当前 v${esc(state.version)}）
+      ${u.latest.notes ? `<details><summary>更新内容</summary>${esc(u.latest.notes)}</details>` : ''}`;
+    action = '<button class="primary" id="applyUpdate">更新所有设备</button>';
+  } else {
+    body = '<b>更新完成</b>';
+  }
+  setHtml(banner, `<div class="body">${body}${results}</div>${action}`);
+}
+
+document.getElementById('updateBanner').addEventListener('click', async e => {
+  if (e.target.id !== 'applyUpdate') return;
+  if (!confirm('将先把新版本推送给所有在线设备，再更新本机。更新期间会短暂断开（约几秒）。继续吗？')) return;
+  try { await api('POST', '/api/update/apply'); refresh(); }
+  catch (err) { toast(err.message); }
+});
+
+document.getElementById('checkUpdate').addEventListener('click', async e => {
+  e.target.disabled = true;
+  try {
+    const available = await api('POST', '/api/update/check');
+    toast(available ? '发现新版本' : '已经是最新版本');
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    e.target.disabled = false;
+    refresh();
+  }
+});
+
+document.getElementById('mirror').addEventListener('change', e => {
+  api('PUT', '/api/settings', { update_mirror: e.target.value }).then(() => toast('已保存')).catch(err => toast(err.message));
+});
+
+// ------------------------------------------------------------ 文件传输
+
+function renderTransfers() {
+  const list = state.transfers;
+  document.getElementById('transferSection').hidden = !list.length;
+  setHtml(document.getElementById('transferList'), list.slice(0, 6).map(t => {
+    const pct = t.total ? Math.floor(t.done * 100 / t.total) : 100;
+    const arrow = t.direction === 'send' ? '发给' : '来自';
+    const st = t.state === 'running' ? `${pct}%` : t.state === 'done' ? '完成' : '失败';
+    return `<div class="transfer ${t.state}">
+      <div class="row"><span>${esc(t.title)}</span><span class="muted">${st}</span></div>
+      <div class="muted" style="font-size:12px">${arrow}「${esc(t.peer)}」· ${t.files} 个文件 · ${fmtBytes(t.total)}</div>
+      ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
+      <div class="bar"><div style="width:${t.state === 'failed' ? 100 : pct}%"></div></div>
+    </div>`;
+  }).join(''));
+}
+
+function fmtBytes(n) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return i ? `${n.toFixed(1)} ${units[i]}` : `${n} B`;
+}
+
+document.getElementById('openDownloads').addEventListener('click', () => api('POST', '/api/open-downloads'));
 
 // ------------------------------------------------------------ 单台设备设置
 

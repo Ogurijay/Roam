@@ -18,6 +18,8 @@ pub enum Action {
     Pause(bool),
     Autostart(bool),
     RevokeHosts,
+    /// 有新版本时更新，否则检查更新。
+    Update,
     Quit,
 }
 
@@ -30,6 +32,8 @@ pub struct State {
     /// 菜单第一行的状态说明。
     pub status: String,
     pub paused: bool,
+    /// 更新菜单项的文字；None 时显示「检查更新」。
+    pub update_label: Option<String>,
 }
 
 /// 需要显示哪些菜单项。
@@ -40,6 +44,7 @@ pub struct Spec {
     pub pause: bool,
     pub revoke_hosts: bool,
     pub autostart: bool,
+    pub update: bool,
 }
 
 pub enum UserEvent {
@@ -95,6 +100,11 @@ impl Tray {
         let pause = CheckMenuItem::new("暂停切屏", true, initial.paused, None);
         let revoke = MenuItem::new("撤销所有已授权的主机", true, None);
         let autostart = CheckMenuItem::new("开机自动启动", true, spec.autostart, None);
+        let update = MenuItem::new(
+            initial.update_label.as_deref().unwrap_or("检查更新"),
+            true,
+            None,
+        );
         let quit = MenuItem::new("退出 Roam", true, None);
 
         let menu = Menu::new();
@@ -113,6 +123,9 @@ impl Tray {
             let _ = menu.append(&revoke);
         }
         let _ = menu.append(&PredefinedMenuItem::separator());
+        if spec.update {
+            let _ = menu.append(&update);
+        }
         let _ = menu.append(&autostart);
         let _ = menu.append(&quit);
 
@@ -147,6 +160,7 @@ impl Tray {
                     if state != current {
                         status.set_text(&state.status);
                         pause.set_checked(state.paused);
+                        update.set_text(state.update_label.as_deref().unwrap_or("检查更新"));
                         if let Some(tray) = &tray {
                             let _ = tray.set_tooltip(Some(&state.tooltip));
                             #[cfg(target_os = "macos")]
@@ -165,6 +179,8 @@ impl Tray {
                         Some(Action::Pause(pause.is_checked()))
                     } else if id == revoke.id() {
                         Some(Action::RevokeHosts)
+                    } else if id == update.id() {
+                        Some(Action::Update)
                     } else if id == autostart.id() {
                         Some(Action::Autostart(autostart.is_checked()))
                     } else if id == quit.id() {

@@ -15,10 +15,13 @@ mod clipboard;
 mod conn;
 mod dialog;
 mod discovery;
+mod files;
 mod host;
 mod pairing;
+mod sync;
 mod tray;
 mod ui;
+mod update;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -85,6 +88,7 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    update::cleanup_old();
     let store = Store::open(cli.config_dir)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -169,7 +173,7 @@ fn run_client_with_tray(runtime: tokio::runtime::Runtime, store: Store) -> Resul
             }
         }
         Action::Quit => std::process::exit(0),
-        Action::OpenUi | Action::Pause(_) => {}
+        Action::OpenUi | Action::Pause(_) | Action::Update => {}
     })
 }
 
@@ -186,6 +190,7 @@ fn run_host_with_tray(
     let spec = Spec {
         open_ui: true,
         pause: true,
+        update: true,
         autostart: autostart::is_enabled(HOST_ARGS),
         ..Default::default()
     };
@@ -204,6 +209,17 @@ fn run_host_with_tray(
             Action::Quit => {
                 host.router.lock().unwrap().return_home();
                 std::process::exit(0);
+            }
+            Action::Update => {
+                let host = host.clone();
+                runtime.spawn(async move {
+                    let available = host.updater.state.lock().unwrap().available;
+                    if available {
+                        let _ = host.update_all().await;
+                    } else {
+                        let _ = host.updater.check().await;
+                    }
+                });
             }
             Action::CopyTicket | Action::RevokeHosts => {}
         }
@@ -247,7 +263,7 @@ async fn start_host(
     #[cfg(windows)]
     roam_input::windows::init_dpi();
 
-    let endpoint = conn::bind(&store).await?;
+    let endpoint = conn::bind(&store, None).await?;
 
     #[cfg(target_os = "macos")]
     let cursor: Box<dyn roam_core::router::CursorControl> =
