@@ -205,7 +205,7 @@ impl Updater {
             .iter()
             .find(|a| a.name == name)
             .with_context(|| format!("v{} 里没有 {name}", release.version))?;
-        let expected = self.expected_hash(release, name, mirror).await?;
+        let expected = self.expected_hash(release, name).await?;
 
         let dir = self.cache.join(&release.version);
         std::fs::create_dir_all(&dir)?;
@@ -249,12 +249,9 @@ impl Updater {
         Ok(path)
     }
 
-    async fn expected_hash(
-        &self,
-        release: &Release,
-        name: &str,
-        mirror: Option<&str>,
-    ) -> Result<[u8; 32]> {
+    /// 校验和总是直接从 GitHub 获取（文件很小），只有安装包走镜像：
+    /// 这样即使镜像不可信，也无法同时伪造安装包和校验和。
+    async fn expected_hash(&self, release: &Release, name: &str) -> Result<[u8; 32]> {
         let sums = release
             .assets
             .iter()
@@ -262,9 +259,11 @@ impl Updater {
             .context("发布里缺少 SHA256SUMS，为安全起见不更新")?;
         let text = self
             .client
-            .get(with_mirror(&sums.url, mirror))
+            .get(&sums.url)
+            .timeout(Duration::from_secs(60))
             .send()
-            .await?
+            .await
+            .context("无法从 GitHub 获取校验和")?
             .error_for_status()?
             .text()
             .await?;
