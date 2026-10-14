@@ -535,6 +535,20 @@ impl Injector {
         self.post(event);
     }
 
+    /// 锁定这台 Mac：模拟系统锁屏快捷键 Ctrl+Cmd+Q。
+    pub fn lock_screen(&mut self) {
+        self.release_all();
+        const KVK_Q: u16 = 0x0C;
+        let flags = CGEventFlags::CGEventFlagControl | CGEventFlags::CGEventFlagCommand;
+        for down in [true, false] {
+            let Some(source) = self.source() else { return };
+            if let Ok(event) = CGEvent::new_keyboard_event(source, KVK_Q, down) {
+                event.set_flags(flags);
+                self.post(event);
+            }
+        }
+    }
+
     fn current_flags(&self) -> u64 {
         let mut flags = self.flags;
         if self.caps_on {

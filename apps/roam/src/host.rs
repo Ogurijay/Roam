@@ -13,7 +13,7 @@ use iroh::{
 };
 use roam_core::{
     config::{Config, Peer, Store},
-    layout::{Cell, DeviceGeom, HOST_CELL, World, default_cell},
+    layout::{Cell, DeviceGeom, HOST_CELL, World, default_cells, grid_key, nearest_free},
     net::{PathKind, selected_path},
     router::{CursorControl, Outbound, PeerLink, Router},
     ticket,
@@ -268,52 +268,113 @@ impl Host {
     pub fn rebuild_world(&self) {
         let mut config = self.config.lock().unwrap();
         let status = self.status.lock().unwrap();
-
-        // 每台设备都在网格里有一个格子（包括还没连上过的设备），缺的补上
         let mut changed = false;
-        let host_cell = *config.grid.entry(self.host_id.clone()).or_insert_with(|| {
-            changed = true;
-            HOST_CELL
-        });
-        let peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
-        for id in &peer_ids {
-            if !config.grid.contains_key(id) {
-                let taken: Vec<Cell> = config.grid.values().copied().collect();
-                config
-                    .grid
-                    .insert(id.clone(), default_cell(&taken, host_cell));
-                changed = true;
-            }
-        }
-        config
+
+        // 旧版本按设备记格子（键只有设备 ID），迁移成第 0 块显示器
+        let old_keys: Vec<String> = config
             .grid
-            .retain(|id, _| *id == self.host_id || peer_ids.contains(id));
-        if changed && let Err(err) = self.store.save(&config) {
-            tracing::warn!("保存配置失败: {err:#}");
+            .keys()
+            .filter(|k| !k.contains('#'))
+            .cloned()
+            .collect();
+        for key in old_keys {
+            if let Some(cell) = config.grid.remove(&key) {
+                config.grid.entry(grid_key(&key, 0)).or_insert(cell);
+            }
+            changed = true;
         }
 
-        // 只有主机和在线、已启用的设备参与切屏
-        let mut devices = vec![DeviceGeom {
-            id: self.host_id.clone(),
-            displays: self.displays.iter().map(|d| d.rect).collect(),
-            cell: host_cell,
-        }];
+        // 每台设备的显示器（还没连上过的设备先按一块算，方便提前摆放）
+        let mut devices: Vec<(String, Vec<roam_proto::Rect>)> = vec![(
+            self.host_id.clone(),
+            self.displays.iter().map(|d| d.rect).collect(),
+        )];
         devices.extend(
             config
                 .peers
                 .iter()
-                .filter(|p| {
-                    p.settings.enabled
-                        && !p.displays.is_empty()
-                        && status.get(&p.id).is_some_and(|s| s.online)
-                })
-                .map(|p| DeviceGeom {
-                    id: p.id.clone(),
-                    displays: p.displays.iter().map(|d| d.rect).collect(),
-                    cell: config.grid[&p.id],
-                }),
+                .map(|p| (p.id.clone(), p.displays.iter().map(|d| d.rect).collect())),
         );
-        let world = World { devices };
+        let valid: std::collections::HashSet<String> = devices
+            .iter()
+            .flat_map(|(id, ds)| (0..ds.len().max(1)).map(|i| grid_key(id, i)))
+            .collect();
+        let before = config.grid.len();
+        config.grid.retain(|key, _| valid.contains(key));
+        changed |= config.grid.len() != before;
+
+        // 缺格子的显示器补上默认位置
+        for (id, displays) in &devices {
+            let n = displays.len().max(1);
+            let missing: Vec<usize> = (0..n)
+                .filter(|&i| !config.grid.contains_key(&grid_key(id, i)))
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            changed = true;
+            let taken: Vec<Cell> = config.grid.values().copied().collect();
+            if missing.len() == n {
+                // 整台设备都没有位置：主机放中间，被控设备放在主机最右边那块屏幕的右侧
+                let anchor = if *id == self.host_id {
+                    HOST_CELL
+                } else {
+                    let host_cells: Vec<Cell> = (0..self.displays.len().max(1))
+                        .filter_map(|i| config.grid.get(&grid_key(&self.host_id, i)).copied())
+                        .collect();
+                    host_cells
+                        .iter()
+                        .max_by_key(|c| c.col)
+                        .map(|c| Cell {
+                            col: c.col + 1,
+                            row: c.row,
+                        })
+                        .unwrap_or(HOST_CELL)
+                };
+                for (i, cell) in default_cells(displays, &taken, anchor)
+                    .into_iter()
+                    .enumerate()
+                {
+                    config.grid.insert(grid_key(id, i), cell);
+                }
+            } else {
+                // 新接了显示器：放在这台设备已有屏幕旁边
+                let near = (0..n)
+                    .find_map(|i| config.grid.get(&grid_key(id, i)).copied())
+                    .unwrap_or(HOST_CELL);
+                for i in missing {
+                    let taken: Vec<Cell> = config.grid.values().copied().collect();
+                    let cell = nearest_free(&taken, near);
+                    config.grid.insert(grid_key(id, i), cell);
+                }
+            }
+        }
+        if changed && let Err(err) = self.store.save(&config) {
+            tracing::warn!("保存配置失败: {err:#}");
+        }
+
+        let geom = |id: &str, displays: &[roam_proto::Rect]| DeviceGeom {
+            id: id.to_string(),
+            displays: displays.to_vec(),
+            cells: (0..displays.len())
+                .map(|i| config.grid[&grid_key(id, i)])
+                .collect(),
+        };
+        // 只有主机和在线、已启用的设备参与切屏
+        let host_rects: Vec<roam_proto::Rect> = self.displays.iter().map(|d| d.rect).collect();
+        let mut world_devices = vec![geom(&self.host_id, &host_rects)];
+        for p in &config.peers {
+            if p.settings.enabled
+                && !p.displays.is_empty()
+                && status.get(&p.id).is_some_and(|s| s.online)
+            {
+                let rects: Vec<roam_proto::Rect> = p.displays.iter().map(|d| d.rect).collect();
+                world_devices.push(geom(&p.id, &rects));
+            }
+        }
+        let world = World {
+            devices: world_devices,
+        };
         drop(status);
         let mut router = self.router.lock().unwrap();
         router.set_swap_cmd_ctrl(config.swap_cmd_ctrl);
@@ -337,23 +398,24 @@ impl Host {
         router.set_world(world);
     }
 
-    /// 把设备挪到某个格子；格子里已有设备时两者交换。
-    pub fn move_device(&self, id: &str, cell: Cell) -> Result<()> {
+    /// 把某台设备的第 `display` 块屏幕挪到某个格子；格子里已有屏幕时两者交换。
+    pub fn move_display(&self, id: &str, display: usize, cell: Cell) -> Result<()> {
         if !cell.in_grid() {
             bail!("格子超出范围");
         }
+        let key = grid_key(id, display);
         {
             let mut config = self.config.lock().unwrap();
-            let old = *config.grid.get(id).context("没有这台设备")?;
+            let old = *config.grid.get(&key).context("没有这块屏幕")?;
             let other = config
                 .grid
                 .iter()
-                .find(|(other, c)| **c == cell && *other != id)
-                .map(|(other, _)| other.clone());
+                .find(|(k, c)| **c == cell && **k != key)
+                .map(|(k, _)| k.clone());
             if let Some(other) = other {
                 config.grid.insert(other, old);
             }
-            config.grid.insert(id.to_string(), cell);
+            config.grid.insert(key, cell);
         }
         self.save_config()?;
         self.rebuild_world();
@@ -398,7 +460,8 @@ impl Host {
         {
             let mut config = self.config.lock().unwrap();
             config.peers.retain(|p| p.id != id);
-            config.grid.remove(id);
+            let prefix = format!("{id}#");
+            config.grid.retain(|k, _| !k.starts_with(&prefix));
         }
         self.save_config()?;
         self.rebuild_world();

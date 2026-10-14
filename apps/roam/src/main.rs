@@ -24,6 +24,8 @@ mod sync;
 mod tray;
 mod ui;
 mod update;
+#[cfg(windows)]
+mod winsvc;
 
 use std::{
     path::PathBuf,
@@ -74,6 +76,20 @@ enum Cmd {
     },
     /// 作为被控端运行：等待主机连接
     Client,
+    /// Windows 锁屏控制服务（由界面调用，一般不需要手动运行）
+    #[command(hide = true)]
+    Service {
+        /// install / uninstall / run
+        action: String,
+        #[arg(long)]
+        log_dir: PathBuf,
+    },
+    /// 锁屏控制的输入助手（由系统服务启动）
+    #[command(hide = true)]
+    InputHelper {
+        #[arg(long)]
+        log_dir: PathBuf,
+    },
     /// 在主机上添加一台被控设备
     Add {
         /// 被控端的连接码
@@ -99,6 +115,9 @@ pub fn relaunch() -> ! {
 fn main() -> Result<()> {
     dialog::attach_parent_console();
     let cli = Cli::parse();
+    if let Some(Cmd::Service { .. } | Cmd::InputHelper { .. }) = &cli.cmd {
+        return run_system_component(cli.cmd.expect("checked above"));
+    }
     update::cleanup_old();
     let store = Store::open(cli.config_dir.clone())?;
     logging::init(&store.dir().join("logs"));
@@ -119,6 +138,7 @@ fn main() -> Result<()> {
         Some(Cmd::Add { ticket, name }) => return add(store, ticket, name.clone()),
         Some(Cmd::Host { demo }) => (Role::Host, *demo),
         Some(Cmd::Client) => (Role::Client, false),
+        Some(Cmd::Service { .. } | Cmd::InputHelper { .. }) => unreachable!("handled above"),
         None => (store.load()?.role(), false),
     };
 
@@ -230,6 +250,42 @@ fn run_with_tray(
             }
         }
     })
+}
+
+/// Windows 锁屏控制：系统服务与输入助手（SYSTEM 身份运行，不显示界面）。
+fn run_system_component(cmd: Cmd) -> Result<()> {
+    #[cfg(windows)]
+    {
+        match cmd {
+            Cmd::Service { action, log_dir } => {
+                logging::init_named(&log_dir, "service.log");
+                let result = match action.as_str() {
+                    "install" => winsvc::install(&log_dir),
+                    "uninstall" => winsvc::uninstall(),
+                    "run" => winsvc::run_service(),
+                    other => Err(anyhow::anyhow!("未知操作 {other}")),
+                };
+                if let Err(err) = &result {
+                    tracing::error!("服务操作 {action} 失败: {err:#}");
+                }
+                result
+            }
+            Cmd::InputHelper { log_dir } => {
+                logging::init_named(&log_dir, "helper.log");
+                let result = winsvc::run_helper();
+                if let Err(err) = &result {
+                    tracing::error!("输入助手退出: {err:#}");
+                }
+                result
+            }
+            _ => Ok(()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+        anyhow::bail!("锁屏控制服务只在 Windows 上使用")
+    }
 }
 
 fn copy_to_clipboard(text: &str) {

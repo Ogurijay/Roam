@@ -1,8 +1,8 @@
-//! 网格布局（与 Deskflow 相同的思路）。
+//! 网格布局（与 Deskflow 相同的思路，细到每块显示器）。
 //!
-//! 每台设备占网格里的一个格子，只有上下左右相邻的格子之间可以穿越。
-//! 设备自己的显示器用本地坐标（逻辑点）描述；跨设备时按边的比例对应，
-//! 所以不需要关心两台设备屏幕的实际尺寸和摆放偏移。
+//! 每块显示器占网格里的一个格子。不同电脑的显示器之间，只有上下左右相邻的格子可以穿越，
+//! 位置沿两块显示器相接的边按比例对应；同一台电脑的几块显示器之间，按它系统设置里的排列移动。
+//! 显示器的位置用各自电脑的本地坐标（逻辑点）描述。
 
 use roam_proto::Rect;
 use serde::{Deserialize, Serialize};
@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 pub type DeviceId = String;
 
 /// 网格大小（列 × 行），与页面保持一致。
-pub const GRID_COLS: i32 = 5;
-pub const GRID_ROWS: i32 = 3;
+pub const GRID_COLS: i32 = 6;
+pub const GRID_ROWS: i32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Cell {
@@ -38,6 +38,11 @@ impl Cell {
     }
 }
 
+/// 网格里一个格子的键：设备 ID + 显示器序号。
+pub fn grid_key(id: &str, display: usize) -> String {
+    format!("{id}#{display}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Left,
@@ -50,6 +55,8 @@ pub trait RectExt {
     fn contains(&self, x: f64, y: f64) -> bool;
     fn clamp(&self, x: f64, y: f64) -> (f64, f64);
     fn distance(&self, x: f64, y: f64) -> f64;
+    /// 点越出了矩形的哪一边（越出两边时取越出更多的那边）；在矩形内返回 None。
+    fn exit_side(&self, x: f64, y: f64) -> Option<Side>;
 }
 
 impl RectExt for Rect {
@@ -67,6 +74,20 @@ impl RectExt for Rect {
     fn distance(&self, x: f64, y: f64) -> f64 {
         let (cx, cy) = self.clamp(x, y);
         ((cx - x).powi(2) + (cy - y).powi(2)).sqrt()
+    }
+
+    fn exit_side(&self, x: f64, y: f64) -> Option<Side> {
+        let candidates = [
+            (Side::Left, self.x - x),
+            (Side::Right, x - (self.x + self.w - 1.0)),
+            (Side::Top, self.y - y),
+            (Side::Bottom, y - (self.y + self.h - 1.0)),
+        ];
+        candidates
+            .into_iter()
+            .filter(|(_, over)| *over > 0.0)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(side, _)| side)
     }
 }
 
@@ -97,12 +118,24 @@ pub fn bbox(rects: &[Rect]) -> Rect {
     }
 }
 
-/// 一台设备：显示器（本地坐标）+ 所在格子。
+/// 从源显示器 `src` 的 `side` 边离开（位置 `x, y`），进入目标显示器 `dst` 时的位置：沿边按比例对应。
+pub fn entry_point(src: Rect, dst: Rect, side: Side, x: f64, y: f64) -> (f64, f64) {
+    let ty = ((y - src.y) / src.h).clamp(0.0, 1.0);
+    let tx = ((x - src.x) / src.w).clamp(0.0, 1.0);
+    match side {
+        Side::Right => (dst.x, dst.y + ty * (dst.h - 1.0)),
+        Side::Left => (dst.x + dst.w - 1.0, dst.y + ty * (dst.h - 1.0)),
+        Side::Bottom => (dst.x + tx * (dst.w - 1.0), dst.y),
+        Side::Top => (dst.x + tx * (dst.w - 1.0), dst.y + dst.h - 1.0),
+    }
+}
+
+/// 一台设备：显示器（本地坐标）+ 每块显示器所在的格子（与 `displays` 一一对应）。
 #[derive(Debug, Clone)]
 pub struct DeviceGeom {
     pub id: DeviceId,
     pub displays: Vec<Rect>,
-    pub cell: Cell,
+    pub cells: Vec<Cell>,
 }
 
 impl DeviceGeom {
@@ -114,11 +147,20 @@ impl DeviceGeom {
         self.displays.iter().any(|d| d.contains(x, y))
     }
 
-    pub fn nearest_display(&self, x: f64, y: f64) -> Rect {
+    /// 离点最近（包含该点时就是它）的显示器序号。
+    pub fn nearest_index(&self, x: f64, y: f64) -> usize {
         self.displays
             .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.distance(x, y).total_cmp(&b.1.distance(x, y)))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
+    pub fn nearest_display(&self, x: f64, y: f64) -> Rect {
+        self.displays
+            .get(self.nearest_index(x, y))
             .copied()
-            .min_by(|a, b| a.distance(x, y).total_cmp(&b.distance(x, y)))
             .unwrap_or_else(|| self.bbox())
     }
 
@@ -127,44 +169,16 @@ impl DeviceGeom {
         self.nearest_display(x, y).clamp(x, y)
     }
 
+    /// 主显示器（本地坐标原点所在的那块，没有就取第一块）的中心。
     pub fn center(&self) -> (f64, f64) {
         let d = self
             .displays
-            .first()
+            .iter()
+            .find(|d| d.contains(0.0, 0.0))
+            .or(self.displays.first())
             .copied()
             .unwrap_or_else(|| self.bbox());
         (d.x + d.w / 2.0, d.y + d.h / 2.0)
-    }
-
-    /// 点越出了设备外框的哪一边（越出两边时取越出更多的那边）；还在外框内返回 None。
-    pub fn exit_side(&self, x: f64, y: f64) -> Option<Side> {
-        let b = self.bbox();
-        let candidates = [
-            (Side::Left, b.x - x),
-            (Side::Right, x - (b.x + b.w - 1.0)),
-            (Side::Top, b.y - y),
-            (Side::Bottom, y - (b.y + b.h - 1.0)),
-        ];
-        candidates
-            .into_iter()
-            .filter(|(_, over)| *over > 0.0)
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(side, _)| side)
-    }
-
-    /// 从 `side` 这一边离开（位置 `x, y`），进入 `target` 时的位置：沿边按比例对应。
-    pub fn entry_into(&self, target: &DeviceGeom, side: Side, x: f64, y: f64) -> (f64, f64) {
-        let src = self.bbox();
-        let dst = target.bbox();
-        let ty = ((y - src.y) / src.h).clamp(0.0, 1.0);
-        let tx = ((x - src.x) / src.w).clamp(0.0, 1.0);
-        let point = match side {
-            Side::Right => (dst.x, dst.y + ty * (dst.h - 1.0)),
-            Side::Left => (dst.x + dst.w - 1.0, dst.y + ty * (dst.h - 1.0)),
-            Side::Bottom => (dst.x + tx * (dst.w - 1.0), dst.y),
-            Side::Top => (dst.x + tx * (dst.w - 1.0), dst.y + dst.h - 1.0),
-        };
-        target.clamp(point.0, point.1)
     }
 }
 
@@ -179,15 +193,70 @@ impl World {
         self.devices.iter().find(|d| d.id == id)
     }
 
-    /// 某台设备在某一边的相邻设备。
-    pub fn neighbor(&self, id: &str, side: Side) -> Option<&DeviceGeom> {
-        let cell = self.find(id)?.cell.neighbor(side);
-        self.devices.iter().find(|d| d.cell == cell)
+    /// 某台设备第 `display` 块显示器在 `side` 那一边相邻的、属于**另一台设备**的显示器。
+    pub fn neighbor(&self, id: &str, display: usize, side: Side) -> Option<(&DeviceGeom, usize)> {
+        let cell = self.find(id)?.cells.get(display)?.neighbor(side);
+        self.devices
+            .iter()
+            .filter(|d| d.id != id)
+            .find_map(|d| d.cells.iter().position(|c| *c == cell).map(|i| (d, i)))
     }
 }
 
-/// 新设备的默认格子：离 `anchor`（通常是主机）最近的空格子，优先放在同一行、右边。
-pub fn default_cell(taken: &[Cell], anchor: Cell) -> Cell {
+/// 主机的主显示器默认放在网格中间偏左上。
+pub const HOST_CELL: Cell = Cell { col: 2, row: 1 };
+
+/// 给一台设备的显示器分配默认格子：主显示器放在 `anchor` 附近最近的空格，
+/// 其他显示器按系统里的相对方向放在旁边，被占用就找最近的空格。
+pub fn default_cells(displays: &[Rect], taken: &[Cell], anchor: Cell) -> Vec<Cell> {
+    let mut taken = taken.to_vec();
+    let mut cells = vec![Cell { col: 0, row: 0 }; displays.len().max(1)];
+    if displays.is_empty() {
+        cells[0] = nearest_free(&taken, anchor);
+        return cells;
+    }
+    let primary = displays
+        .iter()
+        .position(|d| d.contains(0.0, 0.0))
+        .unwrap_or(0);
+    let first = nearest_free(&taken, anchor);
+    cells[primary] = first;
+    taken.push(first);
+
+    let p = displays[primary];
+    let (pcx, pcy) = (p.x + p.w / 2.0, p.y + p.h / 2.0);
+    // 离主显示器近的先放
+    let mut others: Vec<usize> = (0..displays.len()).filter(|&i| i != primary).collect();
+    others.sort_by(|&a, &b| {
+        let d = |i: usize| {
+            let r = displays[i];
+            (r.x + r.w / 2.0 - pcx).abs() + (r.y + r.h / 2.0 - pcy).abs()
+        };
+        d(a).total_cmp(&d(b))
+    });
+    for i in others {
+        let r = displays[i];
+        let (dx, dy) = (r.x + r.w / 2.0 - pcx, r.y + r.h / 2.0 - pcy);
+        let wanted = if dx.abs() >= dy.abs() {
+            Cell {
+                col: first.col + dx.signum() as i32,
+                row: first.row,
+            }
+        } else {
+            Cell {
+                col: first.col,
+                row: first.row + dy.signum() as i32,
+            }
+        };
+        let cell = nearest_free(&taken, wanted);
+        cells[i] = cell;
+        taken.push(cell);
+    }
+    cells
+}
+
+/// 离 `target` 最近的空格子；同距离时同一行、右边优先。
+pub fn nearest_free(taken: &[Cell], target: Cell) -> Cell {
     let mut best: Option<(i32, Cell)> = None;
     for row in 0..GRID_ROWS {
         for col in 0..GRID_COLS {
@@ -195,21 +264,15 @@ pub fn default_cell(taken: &[Cell], anchor: Cell) -> Cell {
             if taken.contains(&cell) {
                 continue;
             }
-            let dist = (col - anchor.col).abs() * 2 + (row - anchor.row).abs() * 3
-                - i32::from(col > anchor.col);
+            let dist = (col - target.col).abs() * 2 + (row - target.row).abs() * 3
+                - i32::from(col > target.col);
             if best.is_none_or(|(d, _)| dist < d) {
                 best = Some((dist, cell));
             }
         }
     }
-    best.map(|(_, c)| c).unwrap_or(anchor)
+    best.map(|(_, c)| c).unwrap_or(target)
 }
-
-/// 主机默认放在网格中央。
-pub const HOST_CELL: Cell = Cell {
-    col: GRID_COLS / 2,
-    row: GRID_ROWS / 2,
-};
 
 #[cfg(test)]
 mod tests {
@@ -219,27 +282,26 @@ mod tests {
         Rect { x, y, w, h }
     }
 
-    fn dev(id: &str, displays: Vec<Rect>, col: i32, row: i32) -> DeviceGeom {
+    fn dev(id: &str, displays: Vec<Rect>, cells: &[(i32, i32)]) -> DeviceGeom {
         DeviceGeom {
             id: id.into(),
             displays,
-            cell: Cell { col, row },
+            cells: cells.iter().map(|&(col, row)| Cell { col, row }).collect(),
         }
     }
 
     #[test]
     fn exit_side_and_proportional_entry() {
-        let mac = dev("mac", vec![rect(0.0, 0.0, 1512.0, 982.0)], 2, 1);
-        let win = dev("win", vec![rect(0.0, 0.0, 1920.0, 1080.0)], 3, 1);
+        let mac = rect(0.0, 0.0, 1512.0, 982.0);
+        let win = rect(0.0, 0.0, 1920.0, 1080.0);
         assert_eq!(mac.exit_side(1515.0, 400.0), Some(Side::Right));
         assert_eq!(mac.exit_side(-3.0, 400.0), Some(Side::Left));
         assert_eq!(mac.exit_side(500.0, 400.0), None);
         // 从 Mac 右边 50% 高度离开 → Windows 左边 50% 高度进入
-        let (x, y) = mac.entry_into(&win, Side::Right, 1511.0, 491.0);
+        let (x, y) = entry_point(mac, win, Side::Right, 1511.0, 491.0);
         assert_eq!(x, 0.0);
         assert!((y - 539.5).abs() < 1.0, "y = {y}");
-        // 反过来从 Windows 左边离开 → Mac 右边缘
-        let (x, _) = win.entry_into(&mac, Side::Left, 0.0, 540.0);
+        let (x, _) = entry_point(win, mac, Side::Left, 0.0, 540.0);
         assert_eq!(x, 1511.0);
     }
 
@@ -252,38 +314,70 @@ mod tests {
                 rect(0.0, 0.0, 1512.0, 982.0),
                 rect(-1920.0, 0.0, 1920.0, 1080.0),
             ],
-            2,
-            1,
+            &[(2, 1), (1, 1)],
         );
         assert!(mac.contains(-100.0, 1000.0));
-        // 主屏下方是外框里的空洞：不算越界，但也不在任何显示器上
+        // 主屏下方是外框里的空洞：不在任何显示器上
         assert!(!mac.contains(100.0, 1000.0));
-        assert_eq!(mac.exit_side(100.0, 1000.0), None);
         assert_eq!(mac.clamp(100.0, 1000.0), (100.0, 981.0));
-        assert_eq!(mac.exit_side(-1925.0, 500.0), Some(Side::Left));
+        assert_eq!(mac.nearest_index(-5.0, 10.0), 1);
+        assert_eq!(mac.center(), (756.0, 491.0));
     }
 
     #[test]
-    fn neighbors_in_grid() {
+    fn neighbors_are_per_display_and_skip_same_device() {
         let world = World {
             devices: vec![
-                dev("mac", vec![rect(0.0, 0.0, 100.0, 100.0)], 2, 1),
-                dev("win", vec![rect(0.0, 0.0, 100.0, 100.0)], 3, 1),
-                dev("imac", vec![rect(0.0, 0.0, 100.0, 100.0)], 2, 0),
+                // Mac：主屏 (2,1)，副屏 (1,1)
+                dev(
+                    "mac",
+                    vec![
+                        rect(0.0, 0.0, 100.0, 100.0),
+                        rect(-100.0, 0.0, 100.0, 100.0),
+                    ],
+                    &[(2, 1), (1, 1)],
+                ),
+                // Windows 两块屏：(3,1) 和 (4,1)
+                dev(
+                    "win",
+                    vec![rect(0.0, 0.0, 100.0, 100.0), rect(100.0, 0.0, 100.0, 100.0)],
+                    &[(3, 1), (4, 1)],
+                ),
+                dev("imac", vec![rect(0.0, 0.0, 100.0, 100.0)], &[(1, 0)]),
             ],
         };
-        assert_eq!(world.neighbor("mac", Side::Right).unwrap().id, "win");
-        assert_eq!(world.neighbor("mac", Side::Top).unwrap().id, "imac");
-        assert!(world.neighbor("mac", Side::Left).is_none());
-        assert!(world.neighbor("win", Side::Top).is_none());
+        // Mac 主屏右边是 Windows 的第 0 块
+        let (d, i) = world.neighbor("mac", 0, Side::Right).unwrap();
+        assert_eq!((d.id.as_str(), i), ("win", 0));
+        // Mac 主屏左边是自己的副屏：不算跨设备
+        assert!(world.neighbor("mac", 0, Side::Left).is_none());
+        // Mac 副屏上方是 iMac
+        let (d, _) = world.neighbor("mac", 1, Side::Top).unwrap();
+        assert_eq!(d.id, "imac");
+        // Windows 第 1 块右边没有
+        assert!(world.neighbor("win", 1, Side::Right).is_none());
     }
 
     #[test]
-    fn default_cells_fill_around_host() {
-        let mut taken = vec![HOST_CELL];
-        let first = default_cell(&taken, HOST_CELL);
-        assert_eq!(first, Cell { col: 3, row: 1 });
-        taken.push(first);
-        assert_eq!(default_cell(&taken, HOST_CELL), Cell { col: 1, row: 1 });
+    fn default_cells_follow_os_arrangement() {
+        // 主屏在中间，副屏在左边、第三块在右边
+        let displays = [
+            rect(0.0, 0.0, 1512.0, 982.0),
+            rect(-1920.0, 0.0, 1920.0, 1080.0),
+            rect(1512.0, 0.0, 2560.0, 1440.0),
+        ];
+        let cells = default_cells(&displays, &[], HOST_CELL);
+        assert_eq!(cells[0], HOST_CELL);
+        assert_eq!(cells[1], Cell { col: 1, row: 1 });
+        assert_eq!(cells[2], Cell { col: 3, row: 1 });
+
+        // 新设备默认放在主机最右边那块屏幕的右侧；被占了就找最近的空格
+        let taken: Vec<Cell> = cells.clone();
+        let anchor = Cell { col: 4, row: 1 };
+        let peer = default_cells(&[rect(0.0, 0.0, 1920.0, 1080.0)], &taken, anchor);
+        assert_eq!(peer, vec![anchor]);
+        let mut taken2 = taken.clone();
+        taken2.push(anchor);
+        assert_eq!(nearest_free(&taken2, anchor), Cell { col: 5, row: 1 });
     }
 }

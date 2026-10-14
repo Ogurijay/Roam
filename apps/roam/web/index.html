@@ -271,7 +271,7 @@
       <div>
         <div class="card grid-card">
           <div class="tools">
-            <span class="grow">把电脑拖到网格里，左右上下相邻的电脑之间光标可以直接穿过去</span>
+            <span class="grow">把屏幕拖到网格里：不同电脑的屏幕左右上下相邻，光标就能直接穿过去。同一台电脑的几块屏幕之间按它系统里的排列移动</span>
             <button id="lockBtn" class="small" title="锁定后光标不会从边缘切走，快捷键仍可用">锁定当前屏幕</button>
             <button id="pauseBtn" class="small">暂停</button>
           </div>
@@ -308,6 +308,11 @@
         <div class="card">
           <h3>已授权的主机</h3>
           <div id="trustedList"></div>
+        </div>
+        <div class="card" id="lockCard" hidden>
+          <h3>锁屏控制</h3>
+          <p class="muted small" style="margin:0 0 8px">Windows 锁屏后，普通程序收不到远程键鼠。启用后会安装一个系统服务（需要管理员确认一次），锁屏时也能用主机的键鼠输入密码解锁。只在锁屏界面生效，不处理管理员确认（UAC）弹窗。</p>
+          <div class="row"><span class="grow" id="lockStatus"></span><button id="lockUninstall" class="small danger">停用</button><button id="lockInstall" class="primary small">启用</button></div>
         </div>
         <div class="card" id="clientTransferCard" hidden>
           <div class="row"><h3 class="grow" style="margin:0">文件传输</h3><button class="link small" data-open-downloads>打开接收文件夹</button></div>
@@ -562,21 +567,28 @@ function renderGrid() {
   const [cols, rows] = h.grid;
   const grid = $('grid');
   grid.style.setProperty('--cols', cols);
+  // 每块显示器一个格子
+  const at = {};
+  for (const d of h.devices) d.cells.forEach((c, i) => { if (c) at[`${c.col},${c.row}`] = [d, i]; });
   let html = '';
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    const d = h.devices.find(d => d.cell && d.cell.col === c && d.cell.row === r);
+    const hit = at[`${c},${r}`];
     let tile = '';
-    if (d) {
+    if (hit) {
+      const [d, i] = hit;
       const disabled = d.settings && !d.settings.enabled;
       const live = d.online && !disabled;
       const status = d.is_host ? '本机' : d.pending_code ? '待确认' : disabled ? '已停用' : d.online ? (d.path || '在线') : '离线';
       const n = deviceNumber(d);
+      const multi = d.displays.length > 1;
+      const disp = d.displays[i];
+      const res = disp ? `${Math.round(disp.rect.w * disp.scale)}×${Math.round(disp.rect.h * disp.scale)}` : '';
       tile = `<div class="tile ${live ? '' : 'offline'} ${selectedId === d.id ? 'selected' : ''} ${h.focused === d.id ? 'focused' : ''}"
-                   draggable="true" data-id="${d.id}" title="${esc(d.name)}">
-        ${n ? `<span class="num">${n}</span>` : ''}${d.is_host ? '<span class="badge-host">主机</span>' : ''}
+                   draggable="true" data-id="${d.id}" data-index="${i}" title="${esc(d.name)}${multi ? ` · 屏幕 ${i + 1}` : ''}${res ? ' · ' + res : ''}">
+        ${n && i === 0 ? `<span class="num">${n}</span>` : ''}${d.is_host && i === 0 ? '<span class="badge-host">主机</span>' : ''}
         <div class="screen"></div>
-        <div class="label">${esc(d.name)}</div>
-        <div class="meta"><span class="dot ${live ? 'on' : d.pending_code ? 'wait' : ''}"></span>${esc(OS[d.os] || '')} · ${esc(status)}</div>
+        <div class="label">${esc(d.name)}${multi ? `<span class="muted"> · ${i + 1}</span>` : ''}</div>
+        <div class="meta"><span class="dot ${live ? 'on' : d.pending_code ? 'wait' : ''}"></span>${esc(multi ? res : (OS[d.os] || ''))} · ${esc(status)}</div>
       </div>`;
     }
     html += `<div class="cell" data-col="${c}" data-row="${r}">${tile}</div>`;
@@ -592,7 +604,7 @@ $('grid').addEventListener('click', e => {
 });
 $('grid').addEventListener('dragstart', e => {
   const tile = e.target.closest('.tile'); if (!tile) return;
-  dragId = tile.dataset.id;
+  dragId = `${tile.dataset.id}|${tile.dataset.index}`;
   e.dataTransfer.effectAllowed = 'move';
   e.dataTransfer.setData('text/plain', dragId);
 });
@@ -607,10 +619,11 @@ $('grid').addEventListener('drop', async e => {
   e.preventDefault();
   const cell = e.target.closest('.cell');
   document.querySelectorAll('.cell.over').forEach(c => c.classList.remove('over'));
-  const id = dragId; dragId = null;
-  if (!cell || !id) return;
+  const drag = dragId; dragId = null;
+  if (!cell || !drag) return;
+  const [id, index] = drag.split('|');
   try {
-    await api('PUT', `/api/grid/${encodeURIComponent(id)}`, { col: Number(cell.dataset.col), row: Number(cell.dataset.row) });
+    await api('PUT', `/api/grid/${encodeURIComponent(id)}/${index}`, { col: Number(cell.dataset.col), row: Number(cell.dataset.row) });
     refresh();
   } catch (err) { toast(err.message); }
 });
@@ -628,7 +641,7 @@ function renderDetail() {
       <div class="kv"><span class="k">系统</span><span>${esc(OS[d.os] || '')}</span>
       <span class="k">显示器</span><span>${screens(d)}</span>
       <span class="k">键鼠采集</span><span>${h.capture_ok ? '<span style="color:var(--ok)">正常</span>' : '未就绪'}</span></div>
-      <p class="muted small" style="margin:8px 0 0">把其他电脑拖到本机旁边的格子里，光标就能从对应的那一边穿过去。</p>
+      <p class="muted small" style="margin:8px 0 0">把其他电脑的屏幕拖到本机某块屏幕旁边的格子里，光标就能从对应的那一边穿过去。</p>
       <button class="link small" data-deselect style="margin-top:8px">← 返回添加设备</button>`);
     return;
   }
@@ -651,7 +664,7 @@ function renderDetail() {
       <label class="check"><input type="checkbox" id="edInvY"><span>反转纵向滚动</span></label>
       <label class="check"><input type="checkbox" id="edInvX"><span>反转横向滚动</span></label>
       <label class="check"><input type="checkbox" id="edClip"><span>同步剪贴板和文件</span></label>
-      <div class="row" style="margin-top:10px"><button class="small" id="edReset">恢复默认</button><span class="grow"></span><button class="small danger" id="edRemove">移除</button></div>`;
+      <div class="row" style="margin-top:10px"><button class="small" id="edLock" title="锁定这台电脑的屏幕">锁定这台电脑</button><button class="small" id="edReset">恢复默认</button><span class="grow"></span><button class="small danger" id="edRemove">移除</button></div>`;
     const cur = () => state.host.devices.find(x => x.id === detailFor);
     const bind = (id, ev, fn) => $(id).addEventListener(ev, fn);
     bind('edName', 'change', e => savePeer({ name: e.target.value }));
@@ -661,6 +674,7 @@ function renderDetail() {
     bind('edInvY', 'change', e => savePeer({ settings: { ...cur().settings, invert_scroll_y: e.target.checked } }));
     bind('edInvX', 'change', e => savePeer({ settings: { ...cur().settings, invert_scroll_x: e.target.checked } }));
     bind('edClip', 'change', e => savePeer({ settings: { ...cur().settings, clipboard: e.target.checked } }));
+    bind('edLock', 'click', () => api('POST', `/api/peers/${encodeURIComponent(detailFor)}/lock`).then(() => toast('已发送锁屏指令')).catch(err => toast(err.message)));
     bind('edReset', 'click', () => savePeer({ settings: { ...cur().settings, pointer_speed: 1, scroll_speed: 1, invert_scroll_y: false, invert_scroll_x: false } }));
     bind('edRemove', 'click', async () => {
       if (!confirm(`移除「${cur().name}」？之后需要重新添加才能控制它。`)) return;
@@ -760,7 +774,11 @@ function renderSwitching() {
   const combo = sw.hotkey_modifiers.map(m => `<kbd>${MOD[m]}</kbd>`).join(' + ');
   const numbered = state.host.devices.map(d => [deviceNumber(d), d.name]).filter(([n]) => n)
     .map(([n, name]) => `${combo} + <kbd>${n}</kbd>　切到「${esc(name)}」`).join('<br>');
-  setHtml($('hotkeyHelp'), `${combo} + <kbd>Esc</kbd>　回到本机<br>${numbered}<br>${combo} + <kbd>L</kbd>　锁定 / 解锁当前屏幕`);
+  const macHost = state.os === 'MacOs';
+  setHtml($('hotkeyHelp'), `${combo} + <kbd>Esc</kbd>　回到本机<br>${numbered}<br>${combo} + <kbd>L</kbd>　锁定 / 解锁当前屏幕（光标不从边缘切走）<br>`
+    + `${combo} + <kbd>Delete</kbd>　锁定正在控制的那台电脑<br>`
+    + (macHost ? `<kbd>Ctrl</kbd> + <kbd>Cmd</kbd> + <kbd>Q</kbd>　控制其他电脑时按，锁定的是那台电脑，不会锁本机<br>` : '')
+    + `<span class="muted small">控制 Windows 时按 Win + L（Mac 上是 Ctrl + L）也能锁定它</span>`);
 }
 let swTimer;
 function saveSwitching(patch) {
@@ -844,10 +862,30 @@ function renderClient() {
     <span class="k">连接路径</span><span>${esc(c.host.path || '—')} ${rttText(c.host.rtt_ms)}</span>
     <span class="k">主机版本</span><span>v${esc(c.host.version)}</span>` : '');
   setHtml($('ticket'), esc(c.ticket));
+  renderLockCard(c);
   setHtml($('trustedList'), c.trusted.length
     ? c.trusted.map(t => `<div class="list-item"><span class="dot ${c.host && c.host.id === t.id ? 'on' : ''}"></span><div class="grow title">${esc(t.name)}</div><button class="small danger" data-revoke="${t.id}">撤销</button></div>`).join('')
     : '<p class="muted small" style="margin:0">还没有授权任何主机。主机第一次连接时会弹窗请你确认。</p>');
 }
+function renderLockCard(c) {
+  $('lockCard').hidden = !c.lock_control;
+  if (!c.lock_control) return;
+  const text = { running: '<span style="color:var(--ok)">已启用</span>，锁屏时也能控制', stopped: '服务已安装但没有运行', not_installed: '未启用' }[c.lock_control];
+  setHtml($('lockStatus'), text);
+  $('lockInstall').hidden = c.lock_control === 'running';
+  $('lockInstall').textContent = c.lock_control === 'stopped' ? '重新启用' : '启用';
+  $('lockUninstall').hidden = c.lock_control === 'not_installed';
+}
+async function lockControl(action, btn) {
+  btn.disabled = true;
+  toast(action === 'install' ? '请在弹出的窗口里确认管理员授权…' : '请在弹出的窗口里确认…');
+  try { await api('POST', `/api/lock-control/${action}`); toast(action === 'install' ? '已启用锁屏控制' : '已停用锁屏控制'); }
+  catch (err) { toast(err.message); }
+  finally { btn.disabled = false; refresh(); }
+}
+$('lockInstall').addEventListener('click', e => lockControl('install', e.target));
+$('lockUninstall').addEventListener('click', e => { if (confirm('停用后，锁屏时将无法远程控制这台电脑。继续吗？')) lockControl('uninstall', e.target); });
+
 $('copyTicket').addEventListener('click', () => api('POST', '/api/copy-ticket').then(() => toast('连接码已复制')).catch(err => toast(err.message)));
 $('trustedList').addEventListener('click', async e => {
   const id = e.target.dataset?.revoke; if (!id) return;

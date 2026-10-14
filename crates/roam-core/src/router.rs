@@ -16,7 +16,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     keymap::{hid, remap_for_target},
-    layout::{DeviceGeom, DeviceId, World},
+    layout::{DeviceGeom, DeviceId, RectExt, World, entry_point},
     settings::{DeviceSettings, Modifier, SwitchSettings},
 };
 
@@ -94,10 +94,13 @@ struct EdgePush {
 /// 判断"光标顶到屏幕边缘"时向外探测的距离。
 const EDGE_PROBE: f64 = 2.0;
 
-/// HID：数字键 1..9 与 L。
+/// HID：数字键 1..9、L、Q、退格（Mac 的 delete）、向前删除。
 const DIGIT_1: u16 = 0x1E;
 const DIGIT_9: u16 = 0x26;
 const KEY_L: u16 = 0x0F;
+const KEY_Q: u16 = 0x14;
+const BACKSPACE: u16 = 0x2A;
+const FORWARD_DELETE: u16 = 0x4C;
 
 pub struct Router {
     host_id: DeviceId,
@@ -230,6 +233,11 @@ impl Router {
         }
     }
 
+    /// 锁定某台被控设备的电脑。
+    pub fn lock_device(&mut self, id: &str) {
+        self.send(id, Outbound::Stream(StreamMsg::LockScreen));
+    }
+
     /// 强制回到主机（逃生热键、断线等），光标放在主屏中央。
     pub fn return_home(&mut self) {
         if !matches!(self.focus, Focus::Remote { .. }) {
@@ -298,30 +306,29 @@ impl Router {
         let Some(host) = self.world.find(&self.host_id).cloned() else {
             return false;
         };
-        // 只有光标已经顶在边缘、还在往外推时才考虑切屏
+        // 只有光标已经顶在某块屏幕的边缘、还在往外推时才考虑切屏
         let probe = (x + dx.signum() * EDGE_PROBE, y + dy.signum() * EDGE_PROBE);
         if host.contains(probe.0, probe.1) {
             self.edge.current = None;
             return false;
         }
-        let Some(side) = host.exit_side(probe.0, probe.1) else {
+        let src_index = host.nearest_index(x, y);
+        let src = host.displays[src_index];
+        let target = src.exit_side(probe.0, probe.1).and_then(|side| {
+            self.world
+                .neighbor(&self.host_id, src_index, side)
+                .filter(|(d, _)| self.peers.contains_key(&d.id))
+                .map(|(d, i)| (side, d.clone(), i))
+        });
+        let Some((side, target, dst_index)) = target else {
             self.edge.current = None;
             return false;
         };
-        let Some(target) = self
-            .world
-            .neighbor(&self.host_id, side)
-            .filter(|d| self.peers.contains_key(&d.id))
-            .cloned()
-        else {
-            self.edge.current = None;
-            return false;
-        };
-        let src = host.nearest_display(x, y);
         if !self.allow_switch(&target.id, src, (x, y), now) {
             return false;
         }
-        let entry = host.entry_into(&target, side, x, y);
+        let (ex, ey) = entry_point(src, target.displays[dst_index], side, x, y);
+        let entry = target.clamp(ex, ey);
         self.cursor.set_locked(true);
         self.cursor.hide();
         self.enter_remote(target.id, entry);
@@ -340,27 +347,30 @@ impl Router {
             return;
         };
         let (cx, cy) = (cursor.0 + dx, cursor.1 + dy);
+        // 同一台电脑的几块屏幕之间按它自己的排列移动
         if current.contains(cx, cy) {
             self.edge.current = None;
             self.set_cursor(&id, (cx, cy));
             return;
         }
 
-        // 往当前设备外面推：看看这一边的格子里有没有可以切过去的设备
-        let clamped = current.clamp(cx, cy);
-        let next = match current.exit_side(cx, cy) {
+        // 推出了当前这块屏幕：看看这一边的格子里有没有另一台电脑的屏幕
+        let src_index = current.nearest_index(cursor.0, cursor.1);
+        let src = current.displays[src_index];
+        let clamped = src.clamp(cx, cy);
+        let next = match src.exit_side(cx, cy) {
             Some(side) if !self.edge_locked && self.buttons_down.is_empty() => self
                 .world
-                .neighbor(&id, side)
-                .filter(|d| d.id == self.host_id || self.peers.contains_key(&d.id))
-                .cloned()
-                .map(|d| (side, d)),
+                .neighbor(&id, src_index, side)
+                .filter(|(d, _)| d.id == self.host_id || self.peers.contains_key(&d.id))
+                .map(|(d, i)| (side, d.clone(), i)),
             _ => None,
         };
-        let src = current.nearest_display(cursor.0, cursor.1);
         match next {
-            Some((side, next)) if self.allow_switch(&next.id, src, clamped, now) => {
-                let entry = current.entry_into(&next, side, clamped.0, clamped.1);
+            Some((side, next, dst_index)) if self.allow_switch(&next.id, src, clamped, now) => {
+                let (ex, ey) =
+                    entry_point(src, next.displays[dst_index], side, clamped.0, clamped.1);
+                let entry = next.clamp(ex, ey);
                 self.leave_remote();
                 if next.id == self.host_id {
                     self.enter_local(entry.0, entry.1);
@@ -372,7 +382,7 @@ impl Router {
                 if next.is_none() {
                     self.edge.current = None;
                 }
-                self.set_cursor(&id, clamped);
+                self.set_cursor(&id, current.clamp(cx, cy));
             }
         }
     }
@@ -551,6 +561,18 @@ impl Router {
             self.hotkey_keys.insert(usage);
             return true;
         }
+        // Mac 的锁屏键 Ctrl+Cmd+Q：正在控制哪台就锁哪台（不让 Mac 自己锁屏）
+        if down
+            && usage == KEY_Q
+            && self.host_os == Os::MacOs
+            && self.modifier_held(Modifier::Ctrl)
+            && self.modifier_held(Modifier::Cmd)
+            && let Some(id) = self.focused().map(str::to_string)
+        {
+            self.lock_device(&id);
+            self.hotkey_keys.insert(usage);
+            return true;
+        }
 
         let Focus::Remote { id, .. } = self.focus.clone() else {
             if down {
@@ -602,6 +624,13 @@ impl Router {
                 self.set_edge_locked(!self.edge_locked);
                 true
             }
+            BACKSPACE | FORWARD_DELETE => match self.focused().map(str::to_string) {
+                Some(id) => {
+                    self.lock_device(&id);
+                    true
+                }
+                None => false,
+            },
             _ => false,
         }
     }
@@ -705,7 +734,7 @@ mod tests {
         DeviceGeom {
             id: id.into(),
             displays: vec![rect(0.0, 0.0, w, h)],
-            cell: Cell { col, row },
+            cells: vec![Cell { col, row }],
         }
     }
 
@@ -846,6 +875,50 @@ mod tests {
     }
 
     #[test]
+    fn multi_display_crossing_uses_each_display_cell() {
+        // Mac 主屏 (2,1) + 副屏在系统里位于主屏右侧、格子 (3,1)；Windows 在 Mac 副屏右边 (4,1)
+        let cursor = MockCursor::default();
+        let mut r = Router::new("mac".into(), Os::MacOs, Box::new(cursor.clone()));
+        r.set_world(World {
+            devices: vec![
+                DeviceGeom {
+                    id: "mac".into(),
+                    displays: vec![
+                        rect(0.0, 0.0, 1000.0, 800.0),
+                        rect(1000.0, 0.0, 1000.0, 800.0),
+                    ],
+                    cells: vec![Cell { col: 2, row: 1 }, Cell { col: 3, row: 1 }],
+                },
+                geom("win", 2000.0, 1000.0, 4, 1),
+            ],
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        r.add_peer(
+            "win".into(),
+            PeerLink {
+                os: Os::Windows,
+                tx,
+            },
+        );
+        // 主屏右边缘是自己的副屏：交给系统处理，不切
+        assert!(!r.handle(mv(999.0, 400.0, 5.0, 0.0)));
+        // 副屏右边缘 → Windows
+        assert!(r.handle(mv(1999.0, 400.0, 5.0, 0.0)));
+        assert_eq!(r.focused(), Some("win"));
+        let (x, y) = enter_of(&drain(&mut rx));
+        assert_eq!(x, 0.0);
+        assert!((y - 500.0).abs() < 1.0);
+        // 从 Windows 左边回来 → Mac 副屏右边缘
+        cursor.0.lock().unwrap().clear();
+        r.handle(mv(0.0, 0.0, -50.0, 0.0));
+        assert_eq!(r.focused(), None);
+        let CursorCall::Warp(wx, _) = cursor.0.lock().unwrap()[0] else {
+            panic!("expected warp");
+        };
+        assert_eq!(wx, 1999.0);
+    }
+
+    #[test]
     fn offline_peer_is_not_entered() {
         let (mut r, _, mut rx) = setup();
         r.remove_peer("win");
@@ -933,6 +1006,38 @@ mod tests {
         drain(&mut rx);
         r.handle(key(DIGIT_1 + 1, true));
         assert_eq!(enter_of(&drain(&mut rx)), (1100.0, 500.0));
+    }
+
+    #[test]
+    fn lock_chords_lock_the_focused_device() {
+        let (mut r, _, mut rx) = setup();
+        r.handle(mv(999.0, 400.0, 5.0, 0.0));
+        drain(&mut rx);
+        // Mac 的 Ctrl+Cmd+Q：发锁屏消息，Q 本身不转发
+        r.handle(key(hid::LEFT_CTRL, true));
+        r.handle(key(hid::LEFT_GUI, true));
+        drain(&mut rx);
+        assert!(r.handle(key(KEY_Q, true)));
+        assert_eq!(
+            drain(&mut rx),
+            vec![Outbound::Stream(StreamMsg::LockScreen)]
+        );
+        assert!(r.handle(key(KEY_Q, false)));
+        assert!(drain(&mut rx).is_empty());
+
+        // 组合键 + Delete 也可以
+        hold_hotkey_mods(&mut r);
+        drain(&mut rx);
+        assert!(r.handle(key(BACKSPACE, true)));
+        assert_eq!(
+            drain(&mut rx),
+            vec![Outbound::Stream(StreamMsg::LockScreen)]
+        );
+
+        // 在本机时组合键 + Delete 不拦截
+        r.return_home();
+        drain(&mut rx);
+        assert!(!r.handle(key(FORWARD_DELETE, true)));
     }
 
     #[test]

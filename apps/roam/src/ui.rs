@@ -12,7 +12,7 @@ use axum::{
 };
 use roam_core::{
     config::Role,
-    layout::{Cell, GRID_COLS, GRID_ROWS},
+    layout::{Cell, GRID_COLS, GRID_ROWS, grid_key},
     settings::{ClipboardSettings, DeviceSettings, SwitchSettings},
 };
 use roam_proto::{DisplayInfo, Os};
@@ -68,12 +68,13 @@ pub async fn serve(app: App, port: u16) -> Result<SocketAddr> {
         .route("/api/open-downloads", post(open_downloads))
         .route("/api/open-logs", post(open_logs))
         // 主机
-        .route("/api/grid/{id}", put(move_device))
+        .route("/api/grid/{id}/{display}", put(move_display))
         .route("/api/peers", post(add_peer))
         .route("/api/peers/{id}", delete(remove_peer))
         .route("/api/peers/{id}/retry", post(retry_peer))
         .route("/api/peers/{id}/settings", put(set_peer_settings))
         .route("/api/peers/{id}/sync-version", post(sync_version))
+        .route("/api/peers/{id}/lock", post(lock_peer))
         .route("/api/lock", put(set_lock))
         .route("/api/pause", put(set_pause))
         .route("/api/home", post(go_home))
@@ -83,6 +84,7 @@ pub async fn serve(app: App, port: u16) -> Result<SocketAddr> {
         // 被控端
         .route("/api/trusted/{id}", delete(revoke_host))
         .route("/api/copy-ticket", post(copy_ticket))
+        .route("/api/lock-control/{action}", post(lock_control))
         .with_state(app);
     // 更新或切换角色后重启时旧进程可能还没完全退出，端口被占用就稍等重试
     let mut attempt = 0;
@@ -123,7 +125,8 @@ struct DeviceView {
     settings: Option<DeviceSettings>,
     version: Option<String>,
     displays: Vec<DisplayInfo>,
-    cell: Option<Cell>,
+    /// 每块显示器所在的格子（还没连上过的设备按一块算）。
+    cells: Vec<Option<Cell>>,
 }
 
 #[derive(Serialize)]
@@ -157,6 +160,8 @@ struct ClientView {
     permission: Option<String>,
     trusted: Vec<TrustedHost>,
     status: String,
+    /// Windows 锁屏控制服务的状态："not_installed" / "stopped" / "running"；其他系统为 None。
+    lock_control: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -202,7 +207,7 @@ fn host_state(host: &Host) -> StateView {
         settings: None,
         version: Some(roam_proto::VERSION.into()),
         displays: host.displays.clone(),
-        cell: config.grid.get(&host.host_id).copied(),
+        cells: cells_of(&config.grid, &host.host_id, host.displays.len()),
     }];
     devices.extend(config.peers.iter().map(|p| {
         let s = status.get(&p.id).cloned().unwrap_or_default();
@@ -220,7 +225,7 @@ fn host_state(host: &Host) -> StateView {
             settings: Some(p.settings.clone()),
             version: s.version,
             displays: p.displays.clone(),
-            cell: config.grid.get(&p.id).copied(),
+            cells: cells_of(&config.grid, &p.id, p.displays.len()),
         }
     }));
 
@@ -292,8 +297,20 @@ fn client_state(client: &Client) -> StateView {
                 })
                 .collect(),
             status,
+            lock_control: lock_control_status(),
         }),
     }
+}
+
+fn lock_control_status() -> Option<&'static str> {
+    #[cfg(windows)]
+    return Some(match crate::winsvc::status() {
+        crate::winsvc::ServiceStatusView::NotInstalled => "not_installed",
+        crate::winsvc::ServiceStatusView::Stopped => "stopped",
+        crate::winsvc::ServiceStatusView::Running => "running",
+    });
+    #[allow(unreachable_code)]
+    None
 }
 
 async fn logs() -> Json<Vec<String>> {
@@ -392,12 +409,22 @@ fn open_path(path: &std::path::Path) {
 
 // ---------------------------------------------------------------- 主机
 
-async fn move_device(
+fn cells_of(
+    grid: &std::collections::BTreeMap<String, Cell>,
+    id: &str,
+    displays: usize,
+) -> Vec<Option<Cell>> {
+    (0..displays.max(1))
+        .map(|i| grid.get(&grid_key(id, i)).copied())
+        .collect()
+}
+
+async fn move_display(
     State(app): State<App>,
-    Path(id): Path<String>,
+    Path((id, display)): Path<(String, usize)>,
     Json(cell): Json<Cell>,
 ) -> ApiResult {
-    app.host()?.move_device(&id, cell)?;
+    app.host()?.move_display(&id, display, cell)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -540,6 +567,21 @@ async fn apply_update(State(app): State<App>) -> ApiResult {
     Ok(StatusCode::ACCEPTED)
 }
 
+async fn lock_peer(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+    let host = app.host()?;
+    if !host
+        .status
+        .lock()
+        .unwrap()
+        .get(&id)
+        .is_some_and(|s| s.online)
+    {
+        return Err(anyhow::anyhow!("这台设备不在线").into());
+    }
+    host.router.lock().unwrap().lock_device(&id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn sync_version(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
     let host = app.host()?.clone();
     tokio::spawn(async move {
@@ -562,4 +604,21 @@ async fn copy_ticket(State(app): State<App>) -> ApiResult {
     tokio::task::spawn_blocking(move || crate::clipboard::with_clipboard(|c| c.set_text(ticket)))
         .await???;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 安装 / 卸载 Windows 锁屏控制服务（会弹出管理员确认）。
+async fn lock_control(State(app): State<App>, Path(action): Path<String>) -> ApiResult {
+    app.client()?;
+    if action != "install" && action != "uninstall" {
+        return Err(anyhow::anyhow!("未知操作").into());
+    }
+    #[cfg(windows)]
+    {
+        let log_dir = crate::logging::dir().unwrap_or_else(std::env::temp_dir);
+        tokio::task::spawn_blocking(move || crate::winsvc::run_elevated(&action, &log_dir))
+            .await??;
+        Ok(StatusCode::NO_CONTENT)
+    }
+    #[cfg(not(windows))]
+    Err(anyhow::anyhow!("只有 Windows 需要锁屏控制服务").into())
 }

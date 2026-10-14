@@ -217,6 +217,16 @@ impl Injector {
     }
 
     pub fn key(&mut self, usage: u16, down: bool) {
+        // Windows 不认程序注入的 Win+L，识别出来后直接调用系统锁屏
+        const KEY_L: u16 = 0x0F;
+        let win_held = self.keys.contains(&roam_core::keymap::hid::LEFT_GUI)
+            || self.keys.contains(&roam_core::keymap::hid::RIGHT_GUI);
+        if usage == KEY_L && win_held {
+            if down {
+                self.lock_screen();
+            }
+            return;
+        }
         let Some((scan, extended)) = hid_to_win(usage) else {
             tracing::debug!("未映射的按键 HID {usage:#x}");
             return;
@@ -289,6 +299,22 @@ impl Injector {
             self.button(button, false);
         }
         self.wheel_acc = (0.0, 0.0);
+    }
+
+    /// 锁定这台电脑。先松开所有按键，避免解锁后卡键。
+    pub fn lock_screen(&mut self) {
+        // Win 键按下后直接抬起会弹出开始菜单，先插一个 Ctrl 按键"打断"它
+        let win_held = self.keys.contains(&roam_core::keymap::hid::LEFT_GUI)
+            || self.keys.contains(&roam_core::keymap::hid::RIGHT_GUI);
+        if win_held {
+            let ctrl = roam_core::keymap::hid::LEFT_CTRL;
+            self.key(ctrl, true);
+            self.key(ctrl, false);
+        }
+        self.release_all();
+        unsafe {
+            windows_sys::Win32::System::Shutdown::LockWorkStation();
+        }
     }
 
     /// 新的会话开始时重置乱序判断。

@@ -154,6 +154,8 @@ pub enum StreamMsg {
         seq: u64,
         sent_us: u64,
     },
+    /// 锁定被控端的电脑（系统不认程序注入的 Win+L，所以单独发一条消息）。
+    LockScreen,
 }
 
 /// 消息编解码错误。

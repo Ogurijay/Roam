@@ -67,10 +67,15 @@ impl Write for Writer {
 
 /// 初始化日志。`dir` 为日志目录。
 pub fn init(dir: &Path) {
+    init_named(dir, "roam.log");
+}
+
+/// 初始化日志，写到 `dir` 下的 `file`（系统服务和输入助手各用自己的文件）。
+pub fn init_named(dir: &Path, file: &str) {
     let _ = std::fs::create_dir_all(dir);
-    let path = dir.join("roam.log");
+    let path = dir.join(file);
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
-        let _ = std::fs::rename(&path, dir.join("roam.log.1"));
+        let _ = std::fs::rename(&path, dir.join(format!("{file}.1")));
     }
     sink().lock().unwrap().file = OpenOptions::new()
         .create(true)

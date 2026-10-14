@@ -139,7 +139,7 @@ impl Client {
     }
 
     async fn accept_loop(self: Arc<Self>, endpoint: iroh::Endpoint) {
-        let injector = Arc::new(Mutex::new(Injector::new()));
+        let injector = Arc::new(Mutex::new(Sink::new()));
         // 同一时间只弹一个授权窗口
         let prompt_lock = Arc::new(tokio::sync::Mutex::new(()));
         let addr_endpoint = endpoint.clone();
@@ -248,7 +248,7 @@ impl Client {
     async fn session(
         self: &Arc<Self>,
         conn: Connection,
-        injector: Arc<Mutex<Injector>>,
+        injector: Arc<Mutex<Sink>>,
         prompt_lock: Arc<tokio::sync::Mutex<()>>,
         my_ticket: String,
     ) -> Result<()> {
@@ -398,6 +398,10 @@ impl Client {
                         StreamMsg::WheelLines { dx, dy } => inj.wheel_lines(dx, dy),
                         StreamMsg::WheelPixels { dx, dy } => inj.wheel_pixels(dx, dy),
                         StreamMsg::KeyState { pressed } => inj.sync_keys(&pressed),
+                        StreamMsg::LockScreen => {
+                            tracing::info!("主机「{}」请求锁定本机", host.name);
+                            inj.lock_screen()
+                        }
                         StreamMsg::Hello(_) | StreamMsg::Pong { .. } | StreamMsg::Ping { .. } => {}
                     }
                 }
@@ -434,3 +438,126 @@ fn check_permission() -> Result<(), String> {
     #[allow(unreachable_code)]
     Ok(())
 }
+
+/// 把收到的键鼠注入本机：平时由本进程注入；Windows 锁屏时（安全桌面）转交给系统服务的输入助手。
+struct Sink {
+    local: Injector,
+    last_seq: Option<u32>,
+    #[cfg(windows)]
+    helper: crate::winsvc::HelperLink,
+    #[cfg(windows)]
+    secure: bool,
+    #[cfg(windows)]
+    checked: Option<std::time::Instant>,
+}
+
+impl Sink {
+    fn new() -> Self {
+        Self {
+            local: Injector::new(),
+            last_seq: None,
+            #[cfg(windows)]
+            helper: crate::winsvc::HelperLink::new(),
+            #[cfg(windows)]
+            secure: false,
+            #[cfg(windows)]
+            checked: None,
+        }
+    }
+
+    /// 尝试交给输入助手；返回 false 表示应由本进程自己注入。
+    #[cfg(windows)]
+    fn via_helper(&mut self, msg: crate::winsvc::HelperMsg) -> bool {
+        // 每 200 毫秒检查一次当前是不是安全桌面（锁屏 / UAC）
+        if self
+            .checked
+            .is_none_or(|t| t.elapsed() > Duration::from_millis(200))
+        {
+            self.secure = crate::winsvc::secure_desktop_active();
+            self.checked = Some(std::time::Instant::now());
+        }
+        self.secure && self.helper.send(&msg)
+    }
+
+    #[cfg(not(windows))]
+    fn via_helper(&mut self, _msg: HelperMsgStub) -> bool {
+        false
+    }
+
+    fn reset_sequence(&mut self) {
+        self.last_seq = None;
+    }
+
+    /// 数据报通道的绝对移动：丢弃乱序到达的旧包。
+    fn mouse_abs(&mut self, seq: u32, x: f32, y: f32) {
+        if let Some(last) = self.last_seq
+            && (seq.wrapping_sub(last) as i32) <= 0
+        {
+            return;
+        }
+        self.last_seq = Some(seq);
+        self.move_to(x, y);
+    }
+
+    fn move_to(&mut self, x: f32, y: f32) {
+        if !self.via_helper(helper_msg!(MoveTo { x, y })) {
+            self.local.move_to(x, y);
+        }
+    }
+
+    fn key(&mut self, usage: u16, down: bool) {
+        if !self.via_helper(helper_msg!(Key { usage, down })) {
+            self.local.key(usage, down);
+        }
+    }
+
+    fn button(&mut self, button: roam_proto::MouseButton, down: bool) {
+        if !self.via_helper(helper_msg!(Button { button, down })) {
+            self.local.button(button, down);
+        }
+    }
+
+    fn wheel_lines(&mut self, dx: i32, dy: i32) {
+        if !self.via_helper(helper_msg!(WheelLines { dx, dy })) {
+            self.local.wheel_lines(dx, dy);
+        }
+    }
+
+    fn wheel_pixels(&mut self, dx: f32, dy: f32) {
+        if !self.via_helper(helper_msg!(WheelPixels { dx, dy })) {
+            self.local.wheel_pixels(dx, dy);
+        }
+    }
+
+    fn sync_keys(&mut self, pressed: &[u16]) {
+        self.local.sync_keys(pressed);
+    }
+
+    fn release_all(&mut self) {
+        self.local.release_all();
+        #[cfg(windows)]
+        {
+            self.helper.send(&crate::winsvc::HelperMsg::ReleaseAll);
+        }
+    }
+
+    fn lock_screen(&mut self) {
+        self.local.lock_screen();
+    }
+}
+
+/// 构造发给输入助手的消息；非 Windows 平台没有助手，用占位类型。
+#[cfg(windows)]
+macro_rules! helper_msg {
+    ($($t:tt)*) => { crate::winsvc::HelperMsg::$($t)* };
+}
+#[cfg(not(windows))]
+macro_rules! helper_msg {
+    ($($t:tt)*) => {
+        HelperMsgStub
+    };
+}
+use helper_msg;
+
+#[cfg(not(windows))]
+struct HelperMsgStub;

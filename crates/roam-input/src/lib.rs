@@ -51,5 +51,6 @@ mod stub {
         pub fn sync_keys(&mut self, _pressed: &[u16]) {}
         pub fn release_all(&mut self) {}
         pub fn reset_sequence(&mut self) {}
+        pub fn lock_screen(&mut self) {}
     }
 }
