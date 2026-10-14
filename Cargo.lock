@@ -3612,6 +3612,8 @@ dependencies = [
  "clap",
  "iroh",
  "mdns-sd",
+ "png",
+ "postcard",
  "roam-core",
  "roam-input",
  "roam-proto",

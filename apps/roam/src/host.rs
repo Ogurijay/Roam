@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{
     Endpoint,
-    endpoint::{ConnectionError, VarInt},
+    endpoint::{Connection, ConnectionError, VarInt},
 };
 use roam_core::{
     config::{Config, Peer, Store},
@@ -18,10 +18,11 @@ use roam_core::{
     router::{CursorControl, Outbound, PeerLink, Router},
     ticket,
 };
-use roam_proto::{ALPN, DisplayInfo, Hello, Os, StreamMsg};
+use roam_proto::{ALPN, ClipboardData, ClipboardPolicy, DisplayInfo, Hello, Os, StreamMsg, side};
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::{
+    clipboard,
     conn::{read_msg, write_msg},
     discovery::{self, Nearby},
     pairing,
@@ -70,7 +71,12 @@ pub struct Host {
     pub nearby: Nearby,
     pub paused: Mutex<bool>,
     tasks: Mutex<HashMap<String, AbortHandle>>,
+    /// 在线设备的连接（剪贴板同步用）。
+    conns: Mutex<HashMap<String, Connection>>,
+    /// 每台设备上次同步的剪贴板摘要，没变就不重复发送。
+    clip_digest: Mutex<HashMap<String, u64>>,
     _mdns: Option<mdns_sd::ServiceDaemon>,
+    me: Mutex<std::sync::Weak<Host>>,
 }
 
 impl Host {
@@ -102,8 +108,12 @@ impl Host {
             nearby: nearby.clone(),
             paused: Mutex::new(false),
             tasks: Mutex::new(HashMap::new()),
+            conns: Mutex::new(HashMap::new()),
+            clip_digest: Mutex::new(HashMap::new()),
             _mdns: mdns,
+            me: Mutex::new(std::sync::Weak::new()),
         });
+        *host.me.lock().unwrap() = Arc::downgrade(&host);
         host.rebuild_world();
         Ok(host)
     }
@@ -124,6 +134,24 @@ impl Host {
         for peer in peers {
             self.spawn_peer(peer);
         }
+        // 光标切到某台设备时，把主机剪贴板同步过去
+        let host = self.clone();
+        tokio::spawn(async move {
+            let mut last: Option<String> = None;
+            loop {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let now = host.router.lock().unwrap().focused().map(str::to_string);
+                if now != last {
+                    if let Some(id) = &now {
+                        let host = host.clone();
+                        let id = id.clone();
+                        tokio::spawn(async move { host.sync_clipboard_to(&id).await });
+                    }
+                    last = now;
+                }
+            }
+        });
+
         let router = self.router.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -424,6 +452,22 @@ impl Host {
         self.rebuild_world();
         tracing::info!("已连接 {}", hello.name);
 
+        self.conns
+            .lock()
+            .unwrap()
+            .insert(peer.id.clone(), conn.clone());
+        self.clip_digest.lock().unwrap().remove(&peer.id);
+        let policy = self.clipboard_policy(&peer.id);
+        if let Err(err) = clipboard::send_side(&conn, side::CLIPBOARD_POLICY, &policy).await {
+            tracing::warn!("发送剪贴板策略失败: {err:#}");
+        }
+        let side_task = {
+            let host = self.this();
+            let conn = conn.clone();
+            let id = peer.id.clone();
+            tokio::spawn(async move { host.receive_side(id, conn).await })
+        };
+
         // 被控端只会回 Pong，后台读掉即可
         let reader = tokio::spawn(async move { while read_msg(&mut recv).await.is_ok() {} });
         let mut status_tick = tokio::time::interval(Duration::from_secs(1));
@@ -447,7 +491,115 @@ impl Host {
             }
         };
         reader.abort();
+        side_task.abort();
+        self.conns.lock().unwrap().remove(&peer.id);
         result
+    }
+
+    // ------------------------------------------------------------ 剪贴板
+
+    fn this(&self) -> Arc<Self> {
+        self.me
+            .lock()
+            .unwrap()
+            .upgrade()
+            .expect("host is alive while sessions run")
+    }
+
+    /// 某台设备的剪贴板同步策略。
+    fn clipboard_policy(&self, id: &str) -> ClipboardPolicy {
+        let config = self.config.lock().unwrap();
+        let per_device = config
+            .peers
+            .iter()
+            .find(|p| p.id == id)
+            .is_some_and(|p| p.settings.clipboard);
+        ClipboardPolicy {
+            enabled: config.clipboard.enabled && per_device,
+            images: config.clipboard.images,
+            max_bytes: config.clipboard.max_bytes(),
+        }
+    }
+
+    /// 设置变化后，把新的策略告诉所有在线设备。
+    pub fn push_clipboard_policies(&self) {
+        let conns: Vec<_> = self
+            .conns
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, c)| (id.clone(), c.clone()))
+            .collect();
+        for (id, conn) in conns {
+            let policy = self.clipboard_policy(&id);
+            tokio::spawn(async move {
+                let _ = clipboard::send_side(&conn, side::CLIPBOARD_POLICY, &policy).await;
+            });
+        }
+    }
+
+    /// 把主机剪贴板发给某台设备（内容没变就跳过）。
+    async fn sync_clipboard_to(&self, id: &str) {
+        let policy = self.clipboard_policy(id);
+        if !policy.enabled {
+            return;
+        }
+        let Some(conn) = self.conns.lock().unwrap().get(id).cloned() else {
+            return;
+        };
+        let Ok(Some(data)) = tokio::task::spawn_blocking(move || clipboard::read(&policy)).await
+        else {
+            return;
+        };
+        let digest = data.digest();
+        if self.clip_digest.lock().unwrap().get(id) == Some(&digest) {
+            return;
+        }
+        let size = data.size();
+        match clipboard::send_side(&conn, side::CLIPBOARD, &data).await {
+            Ok(()) => {
+                tracing::info!("剪贴板 → {}（{size} 字节）", short_id(id));
+                self.clip_digest
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_string(), digest);
+            }
+            Err(err) => tracing::warn!("同步剪贴板失败: {err:#}"),
+        }
+    }
+
+    /// 接收被控端发来的单向流（目前只有剪贴板）。
+    async fn receive_side(self: Arc<Self>, id: String, conn: Connection) {
+        while let Ok(mut stream) = conn.accept_uni().await {
+            let policy = self.clipboard_policy(&id);
+            let (kind, body) =
+                match clipboard::read_side(&mut stream, policy.max_bytes + 1024).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        tracing::warn!("接收失败: {err:#}");
+                        continue;
+                    }
+                };
+            if kind != side::CLIPBOARD || !policy.enabled {
+                continue;
+            }
+            let Ok(data) = clipboard::decode::<ClipboardData>(&body) else {
+                continue;
+            };
+            let digest = data.digest();
+            tracing::info!("剪贴板 ← {}（{} 字节）", short_id(&id), data.size());
+            let written = tokio::task::spawn_blocking(move || clipboard::write(&data)).await;
+            if !matches!(written, Ok(Ok(()))) {
+                tracing::warn!("写入剪贴板失败");
+                continue;
+            }
+            self.clip_digest.lock().unwrap().insert(id.clone(), digest);
+            // 光标已经去了另一台设备：顺手转发过去
+            let focused = self.router.lock().unwrap().focused().map(str::to_string);
+            if let Some(other) = focused.filter(|f| *f != id) {
+                self.sync_clipboard_to(&other).await;
+            }
+        }
     }
 
     fn update_status(&self, id: &str, conn: &iroh::endpoint::Connection) {
@@ -496,4 +648,8 @@ fn friendly_error(err: &anyhow::Error) -> String {
         return "对方断开了连接".into();
     }
     text
+}
+
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(10)]
 }

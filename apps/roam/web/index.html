@@ -295,6 +295,21 @@
       </div>
     </section>
     <section>
+      <h2>剪贴板同步</h2>
+      <label class="toggle field" style="margin-top:0"><input type="checkbox" id="clipEnabled"><span>切屏时同步剪贴板<br><span class="muted">在一台电脑上复制，切到另一台直接粘贴，双向都可以</span></span></label>
+      <label class="toggle field"><input type="checkbox" id="clipImages"><span>同步图片<br><span class="muted">只在复制的内容里没有文字时才同步图片</span></span></label>
+      <div class="field">
+        <div class="head"><span>单次大小上限</span></div>
+        <select id="clipMax">
+          <option value="5">5 MB</option>
+          <option value="20">20 MB</option>
+          <option value="50">50 MB</option>
+          <option value="100">100 MB</option>
+        </select>
+        <div class="desc">超过上限的内容不同步，避免慢速网络下卡顿。</div>
+      </div>
+    </section>
+    <section>
       <h2>快捷键</h2>
       <div class="field" style="margin-top:0">
         <div class="head"><span>修饰键组合</span></div>
@@ -422,6 +437,7 @@ function render() {
 
   renderNearby();
   renderSwitching();
+  renderClipboard();
   renderEditor();
 
   const swap = document.getElementById('swapCmd');
@@ -785,6 +801,27 @@ document.getElementById('lockBtn').addEventListener('click', async () => {
   catch (err) { toast(err.message); }
 });
 
+// ------------------------------------------------------------ 剪贴板
+
+function renderClipboard() {
+  const c = state.clipboard;
+  setValue(document.getElementById('clipEnabled'), c.enabled);
+  setValue(document.getElementById('clipImages'), c.images);
+  setValue(document.getElementById('clipMax'), String(c.max_mb));
+  document.getElementById('clipImages').disabled = !c.enabled;
+  document.getElementById('clipMax').disabled = !c.enabled;
+}
+
+function saveClipboard(patch) {
+  Object.assign(state.clipboard, patch);
+  renderClipboard();
+  api('PUT', '/api/settings', { clipboard: state.clipboard }).catch(err => toast('保存失败：' + err.message));
+}
+
+document.getElementById('clipEnabled').addEventListener('change', e => saveClipboard({ enabled: e.target.checked }));
+document.getElementById('clipImages').addEventListener('change', e => saveClipboard({ images: e.target.checked }));
+document.getElementById('clipMax').addEventListener('change', e => saveClipboard({ max_mb: Number(e.target.value) }));
+
 // ------------------------------------------------------------ 单台设备设置
 
 function selectDevice(id) {
@@ -820,6 +857,7 @@ function renderEditor() {
       </div>
       <label class="toggle field"><input type="checkbox" id="edInvY"><span>反转纵向滚动<br><span class="muted">控制这台设备时，上下滚动方向相反</span></span></label>
       <label class="toggle field"><input type="checkbox" id="edInvX"><span>反转横向滚动</span></label>
+      <label class="toggle field"><input type="checkbox" id="edClip"><span>同步剪贴板<br><span class="muted">需要同时打开下方「剪贴板同步」总开关</span></span></label>
       <button id="edReset">恢复默认</button>`;
     const s = () => state.devices.find(d => d.id === editorFor).settings;
     const bind = (id, ev, fn) => document.getElementById(id).addEventListener(ev, fn);
@@ -829,7 +867,8 @@ function renderEditor() {
     bind('edScroll', 'input', e => savePeer({ settings: { ...s(), scroll_speed: Number(e.target.value) } }));
     bind('edInvY', 'change', e => savePeer({ settings: { ...s(), invert_scroll_y: e.target.checked } }));
     bind('edInvX', 'change', e => savePeer({ settings: { ...s(), invert_scroll_x: e.target.checked } }));
-    bind('edReset', 'click', () => savePeer({ settings: { enabled: s().enabled, pointer_speed: 1, scroll_speed: 1, invert_scroll_y: false, invert_scroll_x: false } }));
+    bind('edClip', 'change', e => savePeer({ settings: { ...s(), clipboard: e.target.checked } }));
+    bind('edReset', 'click', () => savePeer({ settings: { enabled: s().enabled, clipboard: s().clipboard, pointer_speed: 1, scroll_speed: 1, invert_scroll_y: false, invert_scroll_x: false } }));
   }
   const st = dev.settings;
   setValue(document.getElementById('edName'), dev.name);
@@ -838,6 +877,7 @@ function renderEditor() {
   setValue(document.getElementById('edScroll'), st.scroll_speed);
   setValue(document.getElementById('edInvY'), st.invert_scroll_y);
   setValue(document.getElementById('edInvX'), st.invert_scroll_x);
+  setValue(document.getElementById('edClip'), st.clipboard);
   document.getElementById('edPointerVal').textContent = `${st.pointer_speed.toFixed(2)}×`;
   document.getElementById('edScrollVal').textContent = `${st.scroll_speed.toFixed(2)}×`;
 }

@@ -86,6 +86,8 @@ pub struct DeviceSettings {
     pub invert_scroll_y: bool,
     /// 反转横向滚动。
     pub invert_scroll_x: bool,
+    /// 和这台设备同步剪贴板。
+    pub clipboard: bool,
 }
 
 impl Default for DeviceSettings {
@@ -96,7 +98,40 @@ impl Default for DeviceSettings {
             scroll_speed: 1.0,
             invert_scroll_y: false,
             invert_scroll_x: false,
+            clipboard: true,
         }
+    }
+}
+
+/// 剪贴板同步设置（全局）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClipboardSettings {
+    pub enabled: bool,
+    /// 同步图片（没有文本时）。
+    pub images: bool,
+    /// 单次同步的大小上限（MB），超过就不同步。
+    pub max_mb: u32,
+}
+
+impl Default for ClipboardSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            images: true,
+            max_mb: 20,
+        }
+    }
+}
+
+impl ClipboardSettings {
+    pub fn sanitized(mut self) -> Self {
+        self.max_mb = self.max_mb.clamp(1, 200);
+        self
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.max_mb as u64 * 1024 * 1024
     }
 }
 

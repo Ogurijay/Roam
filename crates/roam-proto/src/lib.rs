@@ -232,3 +232,79 @@ mod tests {
         assert_eq!(StreamMsg::decode_body(&frame[2..]).unwrap(), msg);
     }
 }
+
+// ---------------------------------------------------------------- 单向流
+
+/// 单向流的第一个字节表示内容类型，之后是 u32 大端长度和 postcard 编码的内容。
+/// 大块数据（剪贴板图片等）走单向流，不会阻塞键鼠通道。
+pub mod side {
+    pub const CLIPBOARD: u8 = 1;
+    pub const CLIPBOARD_POLICY: u8 = 2;
+}
+
+/// 剪贴板内容。有文本时只同步文本（和富文本），没有文本时才同步图片。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClipboardData {
+    pub text: Option<String>,
+    pub html: Option<String>,
+    /// PNG 编码的图片。
+    pub png: Option<Vec<u8>>,
+}
+
+impl ClipboardData {
+    pub fn is_empty(&self) -> bool {
+        self.text.is_none() && self.html.is_none() && self.png.is_none()
+    }
+
+    pub fn size(&self) -> usize {
+        self.text.as_ref().map_or(0, String::len)
+            + self.html.as_ref().map_or(0, String::len)
+            + self.png.as_ref().map_or(0, Vec::len)
+    }
+
+    /// 内容摘要，用于判断剪贴板是否变化（只在本进程内比较）。
+    pub fn digest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut h);
+        h.finish()
+    }
+}
+
+/// 主机告诉被控端：要不要把剪贴板发过来、发什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ClipboardPolicy {
+    pub enabled: bool,
+    pub images: bool,
+    pub max_bytes: u64,
+}
+
+pub fn encode_side(kind: u8, body: &impl Serialize) -> Result<Vec<u8>, Error> {
+    let body = postcard::to_stdvec(body)?;
+    let mut out = Vec::with_capacity(5 + body.len());
+    out.push(kind);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod side_tests {
+    use super::*;
+
+    #[test]
+    fn side_frame_layout() {
+        let data = ClipboardData {
+            text: Some("你好".into()),
+            html: None,
+            png: None,
+        };
+        let frame = encode_side(side::CLIPBOARD, &data).unwrap();
+        assert_eq!(frame[0], side::CLIPBOARD);
+        let len = u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize;
+        assert_eq!(len, frame.len() - 5);
+        let back: ClipboardData = postcard::from_bytes(&frame[5..]).unwrap();
+        assert_eq!(back, data);
+        assert_eq!(back.digest(), data.digest());
+    }
+}

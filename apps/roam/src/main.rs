@@ -11,6 +11,7 @@
 
 mod autostart;
 mod client;
+mod clipboard;
 mod conn;
 mod dialog;
 mod discovery;
@@ -364,7 +365,8 @@ async fn run_demo(host: Arc<Host>) {
         println!("[演示] ✗ 没能切到被控设备，请检查布局页面里设备是否贴在主机右侧");
         return;
     };
-    println!("[演示] ✓ 已切到 {target}，在对方屏幕上画圈...");
+    println!("[演示] ✓ 已切到 {target}，停留 3 秒后在对方屏幕上画圈...");
+    tokio::time::sleep(Duration::from_secs(3)).await;
     for _ in 0..20 {
         feed(InputEvent::Move {
             x,

@@ -12,7 +12,7 @@ use axum::{
 };
 use roam_core::{
     config::Point,
-    settings::{DeviceSettings, SwitchSettings},
+    settings::{ClipboardSettings, DeviceSettings, SwitchSettings},
 };
 use roam_proto::{DisplayInfo, Os};
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,7 @@ struct StateView {
     focused: Option<String>,
     swap_cmd_ctrl: bool,
     switching: SwitchSettings,
+    clipboard: ClipboardSettings,
     paused: bool,
     edge_locked: bool,
     devices: Vec<DeviceView>,
@@ -124,6 +125,7 @@ async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
         focused,
         swap_cmd_ctrl: config.swap_cmd_ctrl,
         switching: config.switching.clone(),
+        clipboard: config.clipboard.clone(),
         paused: *host.paused.lock().unwrap(),
         edge_locked: host.router.lock().unwrap().edge_locked(),
         nearby: host
@@ -195,6 +197,7 @@ async fn remove_peer(
 struct SettingsBody {
     swap_cmd_ctrl: Option<bool>,
     switching: Option<SwitchSettings>,
+    clipboard: Option<ClipboardSettings>,
 }
 
 async fn set_settings(
@@ -209,9 +212,13 @@ async fn set_settings(
         if let Some(switching) = body.switching {
             config.switching = switching.sanitized();
         }
+        if let Some(clipboard) = body.clipboard {
+            config.clipboard = clipboard.sanitized();
+        }
     }
     host.save_config()?;
     host.rebuild_world();
+    host.push_clipboard_policies();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -244,6 +251,7 @@ async fn set_peer_settings(
     }
     host.save_config()?;
     host.rebuild_world();
+    host.push_clipboard_policies();
     Ok(StatusCode::NO_CONTENT)
 }
 

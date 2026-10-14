@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use roam_proto::{DisplayInfo, Os};
 use serde::{Deserialize, Serialize};
 
-use crate::settings::{DeviceSettings, SwitchSettings};
+use crate::settings::{ClipboardSettings, DeviceSettings, SwitchSettings};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
@@ -55,6 +55,9 @@ pub struct Config {
     /// 切屏手感。
     #[serde(default)]
     pub switching: SwitchSettings,
+    /// 剪贴板同步。
+    #[serde(default)]
+    pub clipboard: ClipboardSettings,
 }
 
 fn default_true() -> bool {
@@ -70,6 +73,7 @@ impl Config {
             layout: BTreeMap::new(),
             swap_cmd_ctrl: true,
             switching: SwitchSettings::default(),
+            clipboard: ClipboardSettings::default(),
         }
     }
 

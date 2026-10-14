@@ -9,9 +9,10 @@ use anyhow::{Result, bail};
 use iroh::endpoint::Connection;
 use roam_core::{config::Store, net::selected_path, ticket};
 use roam_input::Injector;
-use roam_proto::{Datagram, Hello, Os, StreamMsg};
+use roam_proto::{ClipboardData, ClipboardPolicy, Datagram, Hello, Os, StreamMsg, side};
 
 use crate::{
+    clipboard,
     conn::{self, read_msg, write_msg},
     dialog, discovery, pairing,
     tray::{self, TrayHandle},
@@ -165,6 +166,14 @@ async fn session(conn: Connection, injector: Arc<Mutex<Injector>>, ctx: SessionC
         }
     });
 
+    // 剪贴板：主机发来的内容写入本机；光标离开时把本机剪贴板发回主机
+    let clip = ClipState::default();
+    let side_task = {
+        let conn = conn.clone();
+        let clip = clip.clone();
+        tokio::spawn(async move { receive_side(conn, clip).await })
+    };
+
     // 鼠标移动走数据报，单独一个任务处理
     let dgram_conn = conn.clone();
     let dgram_injector = injector.clone();
@@ -193,6 +202,11 @@ async fn session(conn: Connection, injector: Arc<Mutex<Injector>>, ctx: SessionC
                 }),
                 _ => None,
             };
+            if matches!(msg, StreamMsg::Leave) {
+                let conn = conn.clone();
+                let clip = clip.clone();
+                tokio::spawn(async move { send_clipboard(&conn, &clip).await });
+            }
             {
                 let mut inj = injector.lock().unwrap();
                 match msg {
@@ -217,8 +231,71 @@ async fn session(conn: Connection, injector: Arc<Mutex<Injector>>, ctx: SessionC
 
     dgram_task.abort();
     path_task.abort();
+    side_task.abort();
     println!("主机「{}」已断开", host.name);
     result
+}
+
+/// 剪贴板同步状态（每个会话一份）。
+#[derive(Clone, Default)]
+struct ClipState {
+    /// 主机下发的策略；老版本主机不会下发，默认不同步。
+    policy: Arc<Mutex<ClipboardPolicy>>,
+    /// 最近一次收到或发出的内容摘要，没变就不重复发送。
+    last_digest: Arc<Mutex<Option<u64>>>,
+}
+
+async fn receive_side(conn: Connection, clip: ClipState) {
+    while let Ok(mut stream) = conn.accept_uni().await {
+        let max = clip.policy.lock().unwrap().max_bytes.max(64 * 1024) + 1024;
+        let Ok((kind, body)) = clipboard::read_side(&mut stream, max).await else {
+            continue;
+        };
+        match kind {
+            side::CLIPBOARD_POLICY => {
+                if let Ok(policy) = clipboard::decode::<ClipboardPolicy>(&body) {
+                    *clip.policy.lock().unwrap() = policy;
+                }
+            }
+            side::CLIPBOARD => {
+                if !clip.policy.lock().unwrap().enabled {
+                    continue;
+                }
+                let Ok(data) = clipboard::decode::<ClipboardData>(&body) else {
+                    continue;
+                };
+                let digest = data.digest();
+                println!("  剪贴板 ← 主机（{} 字节）", data.size());
+                let written = tokio::task::spawn_blocking(move || clipboard::write(&data)).await;
+                if matches!(written, Ok(Ok(()))) {
+                    *clip.last_digest.lock().unwrap() = Some(digest);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn send_clipboard(conn: &Connection, clip: &ClipState) {
+    let policy = *clip.policy.lock().unwrap();
+    if !policy.enabled {
+        return;
+    }
+    let Ok(Some(data)) = tokio::task::spawn_blocking(move || clipboard::read(&policy)).await else {
+        return;
+    };
+    let digest = data.digest();
+    if *clip.last_digest.lock().unwrap() == Some(digest) {
+        return;
+    }
+    let size = data.size();
+    match clipboard::send_side(conn, side::CLIPBOARD, &data).await {
+        Ok(()) => {
+            println!("  剪贴板 → 主机（{size} 字节）");
+            *clip.last_digest.lock().unwrap() = Some(digest);
+        }
+        Err(err) => eprintln!("同步剪贴板失败: {err:#}"),
+    }
 }
 
 /// 被控端状态，同步到托盘。

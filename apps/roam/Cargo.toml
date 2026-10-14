@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 arboard = "3"
+png = "0.18"
+postcard.workspace = true
 auto-launch = "0.6"
 axum = "0.8"
 blake3 = "1"
