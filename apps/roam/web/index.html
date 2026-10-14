@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roam · 屏幕布局</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --border: #e3e5ea;
+    --text: #1d2129;
+    --muted: #6b7280;
+    --grid: rgba(15, 23, 42, 0.05);
+    --accent: #2563eb;
+    --accent-soft: rgba(37, 99, 235, 0.12);
+    --peer: #0d9488;
+    --peer-soft: rgba(13, 148, 136, 0.12);
+    --offline: #9ca3af;
+    --ok: #16a34a;
+    --warn-bg: #fff7e6;
+    --warn-border: #f5c26b;
+    --warn-text: #8a5a00;
+    --danger: #dc2626;
+    --shadow: 0 1px 2px rgba(0,0,0,.06), 0 4px 16px rgba(0,0,0,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111318;
+      --panel: #1a1d24;
+      --border: #2a2f3a;
+      --text: #e6e8ec;
+      --muted: #8b93a3;
+      --grid: rgba(255, 255, 255, 0.04);
+      --accent: #5b8cff;
+      --accent-soft: rgba(91, 140, 255, 0.16);
+      --peer: #2dd4bf;
+      --peer-soft: rgba(45, 212, 191, 0.14);
+      --offline: #5b6272;
+      --warn-bg: #2b2414;
+      --warn-border: #6b5520;
+      --warn-text: #f2c66d;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 16px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { font-weight: 700; font-size: 16px; letter-spacing: .3px; }
+  .brand small { font-weight: 400; color: var(--muted); margin-left: 8px; font-size: 13px; }
+  .spacer { flex: 1; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; border: 1px solid var(--border); color: var(--muted);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--offline); flex: none; }
+  .dot.on { background: var(--ok); }
+  .pill.focus { border-color: var(--peer); color: var(--peer); background: var(--peer-soft); }
+  button {
+    font: inherit; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    padding: 5px 12px; border-radius: 7px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { filter: brightness(1.08); color: #fff; }
+  button.link { border: none; background: none; padding: 2px 4px; color: var(--muted); font-size: 12px; }
+  button.link:hover { color: var(--danger); }
+
+  .banner {
+    margin: 12px 20px 0; padding: 10px 14px; border-radius: 8px;
+    background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-text);
+    white-space: pre-line; font-size: 13px;
+  }
+
+  main { flex: 1; display: flex; min-height: 0; }
+  #stage {
+    flex: 1; position: relative; overflow: hidden; margin: 16px; border-radius: 12px;
+    background-color: var(--panel); border: 1px solid var(--border);
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+  #stage .hint {
+    position: absolute; left: 16px; bottom: 12px; color: var(--muted); font-size: 12px;
+    pointer-events: none;
+  }
+  #stage .empty {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); text-align: center; padding: 40px;
+  }
+  .device { position: absolute; cursor: grab; user-select: none; touch-action: none; }
+  #stage.ready .device { transition: left .25s ease, top .25s ease, width .25s ease, height .25s ease; }
+  .device.dragging { cursor: grabbing; transition: none; z-index: 10; }
+  .device.dragging .screen { box-shadow: 0 8px 28px rgba(0,0,0,.18); }
+  .screen {
+    position: absolute; border-radius: 6px;
+    border: 2px solid var(--peer); background: var(--peer-soft);
+    box-shadow: var(--shadow);
+  }
+  .device.host .screen { border-color: var(--accent); background: var(--accent-soft); }
+  .device.offline .screen { border-color: var(--offline); border-style: dashed; background: transparent; box-shadow: none; }
+  .device.focused .screen { box-shadow: 0 0 0 4px var(--peer-soft), var(--shadow); }
+  .label {
+    position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+    text-align: center; pointer-events: none; padding: 0 6px; overflow: hidden;
+  }
+  .label .name { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .label .meta { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ghost {
+    position: absolute; border: 2px dashed var(--accent); border-radius: 6px;
+    pointer-events: none; transition: left .08s, top .08s;
+  }
+  .edge {
+    position: absolute; z-index: 5; pointer-events: none; border-radius: 3px;
+    background: #22c55e; box-shadow: 0 0 0 2px rgba(34,197,94,.25), 0 0 12px rgba(34,197,94,.6);
+  }
+
+  aside {
+    width: 340px; flex: none; overflow-y: auto;
+    padding: 16px 16px 24px 0;
+  }
+  section {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; margin-bottom: 12px;
+  }
+  section h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
+  .item { display: flex; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
+  .item:first-of-type { border-top: none; padding-top: 0; }
+  .item .body { flex: 1; min-width: 0; }
+  .item .title { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+  .item .title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .sub { color: var(--muted); font-size: 12px; }
+  .item .err { color: var(--danger); font-size: 12px; word-break: break-all; }
+  .badge {
+    font-size: 11px; font-weight: 500; padding: 0 6px; border-radius: 4px;
+    background: var(--accent-soft); color: var(--accent); flex: none;
+  }
+  .badge.peer { background: var(--peer-soft); color: var(--peer); }
+  textarea, input[type=text] {
+    width: 100%; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+    color: var(--text); background: var(--bg); border: 1px solid var(--border);
+    border-radius: 7px; padding: 7px 9px; margin-bottom: 8px; resize: vertical;
+  }
+  input[type=text] { font-family: inherit; font-size: 13px; }
+  textarea:focus, input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  label.toggle { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+  label.toggle input { margin-top: 3px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  kbd {
+    font: 11px ui-monospace, Menlo, Consolas, monospace; padding: 1px 5px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--bg);
+  }
+  #toast {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px);
+    background: var(--text); color: var(--panel); padding: 8px 14px; border-radius: 8px;
+    font-size: 13px; opacity: 0; transition: all .2s; pointer-events: none; max-width: 80vw;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Roam<small id="hostName"></small></div>
+  <span class="pill" id="capturePill"><span class="dot"></span><span>键鼠采集</span></span>
+  <div class="spacer"></div>
+  <span class="pill focus" id="focusPill" hidden></span>
+  <button id="homeBtn" hidden>回到本机</button>
+</header>
+<div class="banner" id="banner" hidden></div>
+<main>
+  <div id="stage">
+    <div class="hint">拖动屏幕调整位置，松手后会自动贴靠到相邻屏幕。绿色线段是光标可以穿过的边。</div>
+  </div>
+  <aside>
+    <section>
+      <h2>设备</h2>
+      <div id="deviceList"></div>
+    </section>
+    <section>
+      <h2>添加被控设备</h2>
+      <p class="muted" style="margin:0 0 8px">在 Windows 上运行 <kbd>roam client</kbd>，把它打印的连接码粘贴到这里。</p>
+      <textarea id="ticket" rows="3" placeholder="roam1..."></textarea>
+      <input type="text" id="peerName" placeholder="名称（可选，例如：公司台式机）">
+      <button class="primary" id="addBtn">添加</button>
+    </section>
+    <section>
+      <h2>设置</h2>
+      <label class="toggle">
+        <input type="checkbox" id="swapCmd">
+        <span>控制 Windows 时 Cmd ↔ Ctrl 对调<br><span class="muted">开启后 Cmd+C / Cmd+V 在 Windows 上就是 Ctrl+C / Ctrl+V</span></span>
+      </label>
+    </section>
+    <section>
+      <h2>快捷键</h2>
+      <div class="muted">强制回到本机：<kbd>Ctrl</kbd> + <kbd>Option</kbd> + <kbd>Cmd</kbd> + <kbd>Esc</kbd></div>
+    </section>
+  </aside>
+</main>
+<div id="toast"></div>
+
+<script>
+const OS_LABEL = { MacOs: 'macOS', Windows: 'Windows', Linux: 'Linux', Other: '其他' };
+const PAD = 48;          // 画布内边距（像素）
+const MAX_SCALE = 0.3;   // 最大缩放，避免设备少时画得过大
+const ALIGN_PX = 14;     // 对齐吸附阈值（像素）
+
+const stage = document.getElementById('stage');
+let state = null;
+let positions = {};      // 设备 id → 全局位置（工作副本，拖拽时实时修改）
+let view = { scale: 0.1, ox: 0, oy: 0 };
+let drag = null;
+let layoutSig = '';
+const nodes = new Map();
+
+// ------------------------------------------------------------ 数据
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/state');
+    state = await res.json();
+  } catch {
+    showBanner('与 roam host 的连接已断开，请确认它仍在运行。');
+    return;
+  }
+  if (!drag) {
+    positions = {};
+    for (const d of state.devices) if (d.pos) positions[d.id] = { ...d.pos };
+  }
+  const sig = placed().map(d => d.id + ':' + d.displays.length).join('|');
+  if (sig !== layoutSig && !drag) { layoutSig = sig; fitView(); }
+  render();
+}
+
+function placed() {
+  return state ? state.devices.filter(d => d.displays.length && positions[d.id]) : [];
+}
+
+function bboxLocal(displays) {
+  const xs = displays.map(d => d.rect.x), ys = displays.map(d => d.rect.y);
+  const x1 = Math.max(...displays.map(d => d.rect.x + d.rect.w));
+  const y1 = Math.max(...displays.map(d => d.rect.y + d.rect.h));
+  const x = Math.min(...xs), y = Math.min(...ys);
+  return { x, y, w: x1 - x, h: y1 - y };
+}
+
+function worldRect(dev, pos = positions[dev.id]) {
+  const b = bboxLocal(dev.displays);
+  return { x: pos.x, y: pos.y, w: b.w, h: b.h };
+}
+
+function globalDisplays(dev, pos = positions[dev.id]) {
+  const b = bboxLocal(dev.displays);
+  return dev.displays.map(d => ({ x: d.rect.x - b.x + pos.x, y: d.rect.y - b.y + pos.y, w: d.rect.w, h: d.rect.h }));
+}
+
+// ------------------------------------------------------------ 视图
+
+function fitView() {
+  const devs = placed();
+  if (!devs.length) return;
+  const rects = devs.map(d => worldRect(d));
+  const x0 = Math.min(...rects.map(r => r.x)), y0 = Math.min(...rects.map(r => r.y));
+  const x1 = Math.max(...rects.map(r => r.x + r.w)), y1 = Math.max(...rects.map(r => r.y + r.h));
+  const W = stage.clientWidth - PAD * 2, H = stage.clientHeight - PAD * 2;
+  if (W <= 0 || H <= 0) return; // 页面不可见时尺寸为 0
+  const scale = Math.min(W / (x1 - x0), H / (y1 - y0), MAX_SCALE);
+  view = {
+    scale,
+    ox: PAD + (W - (x1 - x0) * scale) / 2 - x0 * scale,
+    oy: PAD + (H - (y1 - y0) * scale) / 2 - y0 * scale,
+  };
+}
+
+const toPx = (x, y) => [view.ox + x * view.scale, view.oy + y * view.scale];
+
+function render() {
+  if (!state) return;
+  const host = state.devices.find(d => d.is_host);
+  document.getElementById('hostName').textContent = host ? '· ' + host.name : '';
+
+  const cap = document.getElementById('capturePill');
+  cap.querySelector('.dot').classList.toggle('on', state.capture_ok);
+  cap.lastElementChild.textContent = state.capture_ok ? '键鼠采集已就绪' : '键鼠采集未就绪';
+  if (!state.capture_ok && state.capture_message) showBanner(state.capture_message); else hideBanner();
+
+  const focused = state.devices.find(d => d.id === state.focused);
+  const fp = document.getElementById('focusPill');
+  fp.hidden = !focused;
+  document.getElementById('homeBtn').hidden = !focused;
+  if (focused) fp.innerHTML = `<span class="dot on"></span>正在控制：${esc(focused.name)}`;
+
+  const swap = document.getElementById('swapCmd');
+  if (document.activeElement !== swap) swap.checked = state.swap_cmd_ctrl;
+
+  renderStage();
+  renderList();
+  // 首次渲染后再开启过渡动画，避免设备从左上角滑入
+  if (!stage.classList.contains('ready')) requestAnimationFrame(() => stage.classList.add('ready'));
+}
+
+function renderStage() {
+  const devs = placed();
+  const seen = new Set();
+  stage.querySelector('.empty')?.remove();
+  if (!devs.length) {
+    stage.insertAdjacentHTML('beforeend', '<div class="empty">还没有可以摆放的屏幕。<br>添加被控设备并等它上线一次后，它的屏幕就会出现在这里。</div>');
+  }
+
+  for (const dev of devs) {
+    seen.add(dev.id);
+    let el = nodes.get(dev.id);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'device';
+      el.addEventListener('pointerdown', e => startDrag(e, dev.id));
+      stage.appendChild(el);
+      nodes.set(dev.id, el);
+    }
+    const r = worldRect(dev);
+    const [left, top] = toPx(r.x, r.y);
+    Object.assign(el.style, {
+      left: left + 'px', top: top + 'px',
+      width: r.w * view.scale + 'px', height: r.h * view.scale + 'px',
+    });
+    el.classList.toggle('host', dev.is_host);
+    el.classList.toggle('offline', !dev.online);
+    el.classList.toggle('focused', dev.id === state.focused);
+    el.classList.toggle('dragging', drag?.id === dev.id);
+
+    const b = bboxLocal(dev.displays);
+    const status = dev.is_host ? '本机 · 主机' : dev.online ? (dev.path || '在线') + rtt(dev) : '离线';
+    const res = dev.displays.map(d => `${Math.round(d.rect.w * d.scale)}×${Math.round(d.rect.h * d.scale)}`).join(' + ');
+    el.innerHTML = dev.displays.map(d => {
+      const s = view.scale;
+      return `<div class="screen" style="left:${(d.rect.x - b.x) * s}px;top:${(d.rect.y - b.y) * s}px;width:${d.rect.w * s - 3}px;height:${d.rect.h * s - 3}px"></div>`;
+    }).join('') + `<div class="label"><div class="name">${esc(dev.name)}</div><div class="meta">${esc(OS_LABEL[dev.os] || '')} · ${res}</div><div class="meta">${esc(status)}</div></div>`;
+  }
+  for (const [id, el] of nodes) if (!seen.has(id)) { el.remove(); nodes.delete(id); }
+
+  // 贴靠预览与可穿越的边
+  stage.querySelectorAll('.ghost, .edge').forEach(n => n.remove());
+  if (drag?.snap) {
+    const dev = devs.find(d => d.id === drag.id);
+    const r = worldRect(dev, drag.snap);
+    const [l, t] = toPx(r.x, r.y);
+    stage.insertAdjacentHTML('beforeend',
+      `<div class="ghost" style="left:${l}px;top:${t}px;width:${r.w * view.scale}px;height:${r.h * view.scale}px"></div>`);
+  }
+  if (!drag) for (const e of sharedEdges(devs)) {
+    const [l, t] = toPx(e.x, e.y);
+    const T = 6, inset = 6; // 线宽；两端各缩进一点，避免和圆角重叠
+    const style = e.w
+      ? `left:${l + inset}px;top:${t - T / 2}px;width:${e.w * view.scale - inset * 2}px;height:${T}px`
+      : `left:${l - T / 2}px;top:${t + inset}px;width:${T}px;height:${e.h * view.scale - inset * 2}px`;
+    stage.insertAdjacentHTML('beforeend', `<div class="edge" style="${style}"></div>`);
+  }
+}
+
+function renderList() {
+  const list = document.getElementById('deviceList');
+  list.innerHTML = state.devices.map(dev => {
+    const status = dev.is_host ? '本机' : dev.online ? `在线 · ${dev.path || ''}${rtt(dev)}` : (dev.displays.length ? '离线' : '等待首次连接');
+    const err = !dev.is_host && !dev.online && dev.error ? `<div class="err">${esc(dev.error)}</div>` : '';
+    return `<div class="item">
+      <span class="dot ${dev.online ? 'on' : ''}" style="margin-top:7px"></span>
+      <div class="body">
+        <div class="title"><span>${esc(dev.name)}</span>
+          <span class="badge ${dev.is_host ? '' : 'peer'}">${dev.is_host ? '主机' : esc(OS_LABEL[dev.os] || '被控')}</span></div>
+        <div class="sub">${esc(status)}</div>${err}
+      </div>
+      ${dev.is_host ? '' : `<button class="link" data-remove="${dev.id}">移除</button>`}
+    </div>`;
+  }).join('');
+}
+
+const rtt = dev => dev.rtt_ms != null ? ` · ${dev.rtt_ms < 10 ? dev.rtt_ms.toFixed(1) : Math.round(dev.rtt_ms)} ms` : '';
+
+// 不同设备之间相互接触的显示器边，即光标可以穿过的地方
+function sharedEdges(devs) {
+  const edges = [];
+  const EPS = 1;
+  for (let i = 0; i < devs.length; i++) for (let j = i + 1; j < devs.length; j++) {
+    for (const a of globalDisplays(devs[i])) for (const b of globalDisplays(devs[j])) {
+      for (const [p, q] of [[a, b], [b, a]]) {
+        if (Math.abs(p.x + p.w - q.x) < EPS) {
+          const y0 = Math.max(p.y, q.y), y1 = Math.min(p.y + p.h, q.y + q.h);
+          if (y1 - y0 > EPS) edges.push({ x: q.x, y: y0, w: 0, h: y1 - y0 });
+        }
+        if (Math.abs(p.y + p.h - q.y) < EPS) {
+          const x0 = Math.max(p.x, q.x), x1 = Math.min(p.x + p.w, q.x + q.w);
+          if (x1 - x0 > EPS) edges.push({ x: x0, y: q.y, w: x1 - x0, h: 0 });
+        }
+      }
+    }
+  }
+  return edges;
+}
+
+// ------------------------------------------------------------ 拖拽与吸附
+
+function startDrag(e, id) {
+  e.preventDefault();
+  e.currentTarget.setPointerCapture(e.pointerId);
+  drag = { id, sx: e.clientX, sy: e.clientY, orig: { ...positions[id] }, snap: null };
+  render();
+}
+
+window.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const p = {
+    x: drag.orig.x + (e.clientX - drag.sx) / view.scale,
+    y: drag.orig.y + (e.clientY - drag.sy) / view.scale,
+  };
+  positions[drag.id] = p;
+  drag.snap = snapPosition(drag.id, p);
+  renderStage();
+});
+
+window.addEventListener('pointerup', async () => {
+  if (!drag) return;
+  const { id, snap, orig } = drag;
+  positions[id] = snap || orig;
+  drag = null;
+  fitView();
+  render();
+  try {
+    await api('PUT', '/api/layout', { positions });
+  } catch (err) {
+    toast('保存失败：' + err.message);
+  }
+});
+
+const overlaps = (a, b) => a.x < b.x + b.w - 0.5 && b.x < a.x + a.w - 0.5 && a.y < b.y + b.h - 0.5 && b.y < a.y + a.h - 0.5;
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+/// 把被拖动的设备贴到最近的另一台设备的某条边上，并在接近时对齐顶部 / 底部 / 中线。
+function snapPosition(id, p) {
+  const devs = placed();
+  const me = devs.find(d => d.id === id);
+  const others = devs.filter(d => d.id !== id).map(d => worldRect(d));
+  if (!others.length) return p;
+  const m = worldRect(me, p);
+  const align = ALIGN_PX / view.scale;
+  const pick = (v, targets) => targets.reduce((best, t) => Math.abs(v - t) < Math.abs(v - best) && Math.abs(v - t) < align ? t : best, v);
+
+  const cands = [];
+  for (const o of others) {
+    const minOv = Math.min(120, m.h * 0.3, o.h * 0.3);
+    const minOvX = Math.min(120, m.w * 0.3, o.w * 0.3);
+    const y = pick(clamp(p.y, o.y - m.h + minOv, o.y + o.h - minOv), [o.y, o.y + o.h - m.h, o.y + (o.h - m.h) / 2]);
+    const x = pick(clamp(p.x, o.x - m.w + minOvX, o.x + o.w - minOvX), [o.x, o.x + o.w - m.w, o.x + (o.w - m.w) / 2]);
+    cands.push({ x: o.x + o.w, y }, { x: o.x - m.w, y }, { x, y: o.y + o.h }, { x, y: o.y - m.h });
+  }
+  let best = null, bestDist = Infinity;
+  for (const c of cands) {
+    const r = { ...m, x: c.x, y: c.y };
+    if (others.some(o => overlaps(r, o))) continue;
+    const dist = Math.hypot(c.x - p.x, c.y - p.y);
+    if (dist < bestDist) { best = c; bestDist = dist; }
+  }
+  return best;
+}
+
+// ------------------------------------------------------------ 操作
+
+async function api(method, url, body) {
+  const res = await fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(await res.text() || res.statusText);
+  return res.status === 204 ? null : res.json();
+}
+
+document.getElementById('addBtn').addEventListener('click', async () => {
+  const ticket = document.getElementById('ticket').value.trim();
+  const name = document.getElementById('peerName').value.trim();
+  if (!ticket) return toast('请先粘贴连接码');
+  try {
+    await api('POST', '/api/peers', { ticket, name: name || null });
+    document.getElementById('ticket').value = '';
+    document.getElementById('peerName').value = '';
+    toast('已添加，正在连接…（首次连接需要在被控端终端输入 y 确认）');
+    refresh();
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+document.getElementById('deviceList').addEventListener('click', async e => {
+  const id = e.target.dataset?.remove;
+  if (!id) return;
+  const dev = state.devices.find(d => d.id === id);
+  if (!confirm(`移除「${dev?.name}」？之后需要重新粘贴连接码才能再次控制它。`)) return;
+  try { await api('DELETE', '/api/peers/' + encodeURIComponent(id)); refresh(); }
+  catch (err) { toast(err.message); }
+});
+
+document.getElementById('swapCmd').addEventListener('change', async e => {
+  try { await api('PUT', '/api/settings', { swap_cmd_ctrl: e.target.checked }); }
+  catch (err) { toast(err.message); }
+});
+
+document.getElementById('homeBtn').addEventListener('click', () => api('POST', '/api/home').then(refresh));
+
+// ------------------------------------------------------------ 杂项
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function showBanner(msg) { const b = document.getElementById('banner'); b.textContent = msg; b.hidden = false; }
+function hideBanner() { document.getElementById('banner').hidden = true; }
+let toastTimer;
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
+}
+
+// 画布尺寸变化（窗口缩放、页面从后台切到前台）时重新适配
+new ResizeObserver(() => { if (!drag) { fitView(); render(); } }).observe(stage);
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

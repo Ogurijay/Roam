@@ -10,7 +10,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 iroh = "1.3"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }

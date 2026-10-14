@@ -1,0 +1,25 @@
+[package]
+name = "roam-core"
+description = "Roam 平台无关逻辑：配置、连接码、布局几何、键码映射"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+data-encoding = { version = "2", optional = true }
+dirs = "7"
+iroh = { workspace = true, optional = true }
+postcard = { workspace = true, optional = true }
+roam-proto = { path = "../roam-proto" }
+serde.workspace = true
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+
+[features]
+default = ["net"]
+# 连接码、路径分类、设备密钥（依赖 iroh）
+net = ["dep:iroh", "dep:data-encoding", "dep:postcard"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync"] }
