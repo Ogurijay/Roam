@@ -365,6 +365,23 @@ pub fn restart() -> ! {
     }
 }
 
+/// 用指定参数重新启动自己（切换角色时用）。
+pub fn restart_with(args: &[String]) -> ! {
+    let exe = std::env::current_exe().expect("current exe");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe).args(args).exec();
+        eprintln!("重启失败: {err}");
+        std::process::exit(1);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::process::Command::new(&exe).args(args).spawn();
+        std::process::exit(0);
+    }
+}
+
 /// 启动时清理上次更新留下的旧程序（Windows 上旧进程可能还没完全退出，稍后重试）。
 pub fn cleanup_old() {
     let Ok(exe) = std::env::current_exe() else {

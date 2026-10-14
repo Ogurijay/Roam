@@ -1,6 +1,6 @@
-//! 布局页面：只监听 127.0.0.1，浏览器打开后拖拽排列屏幕。
+//! 界面后端：只监听 127.0.0.1，应用窗口（或浏览器）里显示。主机和被控端共用一个页面。
 
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use axum::{
@@ -11,13 +11,15 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use roam_core::{
-    config::Point,
+    config::Role,
+    layout::{Cell, GRID_COLS, GRID_ROWS},
     settings::{ClipboardSettings, DeviceSettings, SwitchSettings},
 };
 use roam_proto::{DisplayInfo, Os};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    client::{Client, ConnectedHost},
     discovery::Discovered,
     files::{self, TransferInfo},
     host::Host,
@@ -26,25 +28,63 @@ use crate::{
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
-pub async fn serve(host: Arc<Host>, port: u16) -> Result<SocketAddr> {
-    let app = Router::new()
+/// 当前运行的角色。
+#[derive(Clone)]
+pub enum App {
+    Host(Arc<Host>),
+    Client(Arc<Client>),
+}
+
+impl App {
+    fn host(&self) -> Result<&Arc<Host>, ApiError> {
+        match self {
+            App::Host(h) => Ok(h),
+            App::Client(_) => Err(anyhow::anyhow!("本机是被控端，不能执行这个操作").into()),
+        }
+    }
+
+    fn client(&self) -> Result<&Arc<Client>, ApiError> {
+        match self {
+            App::Client(c) => Ok(c),
+            App::Host(_) => Err(anyhow::anyhow!("本机是主机，不能执行这个操作").into()),
+        }
+    }
+
+    fn store(&self) -> &roam_core::config::Store {
+        match self {
+            App::Host(h) => &h.store,
+            App::Client(c) => &c.store,
+        }
+    }
+}
+
+pub async fn serve(app: App, port: u16) -> Result<SocketAddr> {
+    let router = Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         .route("/api/state", get(state))
-        .route("/api/layout", put(set_layout))
+        .route("/api/logs", get(logs))
+        .route("/api/role", put(set_role))
+        .route("/api/name", put(set_name))
+        .route("/api/open-downloads", post(open_downloads))
+        .route("/api/open-logs", post(open_logs))
+        // 主机
+        .route("/api/grid/{id}", put(move_device))
         .route("/api/peers", post(add_peer))
         .route("/api/peers/{id}", delete(remove_peer))
         .route("/api/peers/{id}/retry", post(retry_peer))
         .route("/api/peers/{id}/settings", put(set_peer_settings))
+        .route("/api/peers/{id}/sync-version", post(sync_version))
         .route("/api/lock", put(set_lock))
+        .route("/api/pause", put(set_pause))
+        .route("/api/home", post(go_home))
+        .route("/api/settings", put(set_settings))
         .route("/api/update/check", post(check_update))
         .route("/api/update/apply", post(apply_update))
-        .route("/api/peers/{id}/sync-version", post(sync_version))
-        .route("/api/open-downloads", post(open_downloads))
-        .route("/api/pause", put(set_pause))
-        .route("/api/settings", put(set_settings))
-        .route("/api/home", post(go_home))
-        .with_state(host);
-    // 更新后重启时旧进程可能还没完全退出，端口被占用就稍等重试
+        // 被控端
+        .route("/api/trusted/{id}", delete(revoke_host))
+        .route("/api/copy-ticket", post(copy_ticket))
+        .with_state(app);
+    // 更新或切换角色后重启时旧进程可能还没完全退出，端口被占用就稍等重试
     let mut attempt = 0;
     let listener = loop {
         match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
@@ -59,12 +99,14 @@ pub async fn serve(host: Arc<Host>, port: u16) -> Result<SocketAddr> {
     };
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            tracing::error!("布局页面服务退出: {err:#}");
+        if let Err(err) = axum::serve(listener, router).await {
+            tracing::error!("界面服务退出: {err:#}");
         }
     });
     Ok(addr)
 }
+
+// ---------------------------------------------------------------- 状态
 
 #[derive(Serialize)]
 struct DeviceView {
@@ -81,17 +123,11 @@ struct DeviceView {
     settings: Option<DeviceSettings>,
     version: Option<String>,
     displays: Vec<DisplayInfo>,
-    pos: Option<Point>,
+    cell: Option<Cell>,
 }
 
 #[derive(Serialize)]
-struct StateView {
-    host_id: String,
-    version: &'static str,
-    update: UpdateState,
-    update_mirror: Option<String>,
-    transfers: Vec<TransferInfo>,
-    downloads_dir: String,
+struct HostView {
     capture_ok: bool,
     capture_message: Option<String>,
     focused: Option<String>,
@@ -101,15 +137,56 @@ struct StateView {
     paused: bool,
     edge_locked: bool,
     devices: Vec<DeviceView>,
-    /// 局域网里发现、但还没添加的设备。
     nearby: Vec<Discovered>,
+    update: UpdateState,
+    update_mirror: Option<String>,
+    grid: (i32, i32),
 }
 
-async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
+#[derive(Serialize)]
+struct TrustedHost {
+    id: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct ClientView {
+    ticket: String,
+    host: Option<ConnectedHost>,
+    pending: Option<(String, String)>,
+    permission: Option<String>,
+    trusted: Vec<TrustedHost>,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct StateView {
+    role: Role,
+    id: String,
+    name: String,
+    os: Os,
+    version: &'static str,
+    transfers: Vec<TransferInfo>,
+    downloads_dir: String,
+    host: Option<HostView>,
+    client: Option<ClientView>,
+}
+
+async fn state(State(app): State<App>) -> Json<StateView> {
+    match app {
+        App::Host(host) => Json(host_state(&host)),
+        App::Client(client) => Json(client_state(&client)),
+    }
+}
+
+fn host_state(host: &Host) -> StateView {
     let config = host.config.lock().unwrap().clone();
     let status = host.status.lock().unwrap().clone();
     let capture = host.capture.lock().unwrap().clone();
-    let focused = host.router.lock().unwrap().focused().map(str::to_string);
+    let (focused, edge_locked) = {
+        let router = host.router.lock().unwrap();
+        (router.focused().map(str::to_string), router.edge_locked())
+    };
 
     let mut devices = vec![DeviceView {
         id: host.host_id.clone(),
@@ -125,7 +202,7 @@ async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
         settings: None,
         version: Some(roam_proto::VERSION.into()),
         displays: host.displays.clone(),
-        pos: config.layout.get(&host.host_id).copied(),
+        cell: config.grid.get(&host.host_id).copied(),
     }];
     devices.extend(config.peers.iter().map(|p| {
         let s = status.get(&p.id).cloned().unwrap_or_default();
@@ -143,34 +220,87 @@ async fn state(State(host): State<Arc<Host>>) -> Json<StateView> {
             settings: Some(p.settings.clone()),
             version: s.version,
             displays: p.displays.clone(),
-            pos: config.layout.get(&p.id).copied(),
+            cell: config.grid.get(&p.id).copied(),
         }
     }));
 
-    Json(StateView {
-        host_id: host.host_id.clone(),
+    StateView {
+        role: Role::Host,
+        id: host.host_id.clone(),
+        name: config.name.clone(),
+        os: Os::current(),
         version: roam_proto::VERSION,
-        update: host.updater.state.lock().unwrap().clone(),
-        update_mirror: config.update_mirror.clone(),
         transfers: host.transfers.list(),
         downloads_dir: files::default_dir().display().to_string(),
-        capture_ok: capture.is_ok(),
-        capture_message: capture.err(),
-        focused,
-        swap_cmd_ctrl: config.swap_cmd_ctrl,
-        switching: config.switching.clone(),
-        clipboard: config.clipboard.clone(),
-        paused: *host.paused.lock().unwrap(),
-        edge_locked: host.router.lock().unwrap().edge_locked(),
-        nearby: host
-            .nearby
-            .list()
-            .into_iter()
-            .filter(|d| d.id != host.host_id && !config.peers.iter().any(|p| p.id == d.id))
-            .collect(),
-        devices,
-    })
+        client: None,
+        host: Some(HostView {
+            capture_ok: capture.is_ok(),
+            capture_message: capture.err(),
+            focused,
+            swap_cmd_ctrl: config.swap_cmd_ctrl,
+            switching: config.switching.clone(),
+            clipboard: config.clipboard.clone(),
+            paused: *host.paused.lock().unwrap(),
+            edge_locked,
+            nearby: host
+                .nearby
+                .list()
+                .into_iter()
+                .filter(|d| d.id != host.host_id && !config.peers.iter().any(|p| p.id == d.id))
+                .collect(),
+            devices,
+            update: host.updater.state.lock().unwrap().clone(),
+            update_mirror: config.update_mirror.clone(),
+            grid: (GRID_COLS, GRID_ROWS),
+        }),
+    }
 }
+
+fn client_state(client: &Client) -> StateView {
+    let config = client.store.load().unwrap_or_else(|_| {
+        // 读不到配置时也要能显示界面
+        serde_json::from_str(r#"{"name":"本机"}"#).expect("minimal config")
+    });
+    // 先分别取出各项再组装：在同一个表达式里多次加锁会自己等自己（死锁）
+    let host = client.host.lock().unwrap().clone();
+    let pending = client.pending.lock().unwrap().clone();
+    let status = client.status_text();
+    StateView {
+        role: Role::Client,
+        id: client.id.clone(),
+        name: config.name.clone(),
+        os: Os::current(),
+        version: roam_proto::VERSION,
+        transfers: client.transfers.list(),
+        downloads_dir: files::default_dir().display().to_string(),
+        host: None,
+        client: Some(ClientView {
+            ticket: client.ticket.clone(),
+            host,
+            pending,
+            permission: client.permission.clone().err(),
+            trusted: config
+                .trusted_hosts
+                .iter()
+                .map(|id| TrustedHost {
+                    id: id.clone(),
+                    name: config
+                        .host_names
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("主机 {}", &id[..id.len().min(10)])),
+                })
+                .collect(),
+            status,
+        }),
+    }
+}
+
+async fn logs() -> Json<Vec<String>> {
+    Json(crate::logging::recent(400))
+}
+
+// ---------------------------------------------------------------- 错误
 
 struct ApiError(anyhow::Error);
 
@@ -186,23 +316,88 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
     }
 }
 
+type ApiResult<T = StatusCode> = Result<T, ApiError>;
+
+// ---------------------------------------------------------------- 通用
+
 #[derive(Deserialize)]
-struct LayoutBody {
-    positions: BTreeMap<String, Point>,
+struct RoleBody {
+    role: Role,
 }
 
-async fn set_layout(
-    State(host): State<Arc<Host>>,
-    Json(body): Json<LayoutBody>,
-) -> Result<StatusCode, ApiError> {
-    {
-        let mut config = host.config.lock().unwrap();
-        for (id, pos) in body.positions {
-            config.layout.insert(id, pos);
+/// 切换角色：保存后用新角色重启程序。
+async fn set_role(State(app): State<App>, Json(body): Json<RoleBody>) -> ApiResult {
+    let store = app.store().clone();
+    let mut config = store.load()?;
+    config.role = Some(body.role);
+    store.save(&config)?;
+    if let App::Host(host) = &app {
+        host.router.lock().unwrap().return_home();
+    }
+    tracing::info!("切换角色为 {:?}，正在重启…", body.role);
+    tokio::spawn(async {
+        // 先把响应发回去，再重启
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        crate::relaunch();
+    });
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Deserialize)]
+struct NameBody {
+    name: String,
+}
+
+async fn set_name(State(app): State<App>, Json(body): Json<NameBody>) -> ApiResult {
+    let name = body.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 40 {
+        return Err(anyhow::anyhow!("名称不能为空，也不能超过 40 个字").into());
+    }
+    match &app {
+        App::Host(host) => {
+            host.config.lock().unwrap().name = name;
+            host.save_config()?;
+        }
+        App::Client(client) => {
+            let mut config = client.store.load()?;
+            config.name = name;
+            client.store.save(&config)?;
         }
     }
-    host.save_config()?;
-    host.rebuild_world();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn open_downloads() -> StatusCode {
+    let dir = files::default_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    open_path(&dir);
+    StatusCode::NO_CONTENT
+}
+
+async fn open_logs() -> StatusCode {
+    if let Some(dir) = crate::logging::dir() {
+        open_path(&dir);
+    }
+    StatusCode::NO_CONTENT
+}
+
+fn open_path(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+// ---------------------------------------------------------------- 主机
+
+async fn move_device(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(cell): Json<Cell>,
+) -> ApiResult {
+    app.host()?.move_device(&id, cell)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -213,17 +408,19 @@ struct AddPeerBody {
 }
 
 async fn add_peer(
-    State(host): State<Arc<Host>>,
+    State(app): State<App>,
     Json(body): Json<AddPeerBody>,
-) -> Result<Json<String>, ApiError> {
-    Ok(Json(host.add_peer(&body.ticket, body.name)?))
+) -> ApiResult<Json<String>> {
+    Ok(Json(app.host()?.add_peer(&body.ticket, body.name)?))
 }
 
-async fn remove_peer(
-    State(host): State<Arc<Host>>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    host.remove_peer(&id)?;
+async fn remove_peer(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+    app.host()?.remove_peer(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn retry_peer(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+    app.host()?.retry_peer(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -236,10 +433,8 @@ struct SettingsBody {
     update_mirror: Option<String>,
 }
 
-async fn set_settings(
-    State(host): State<Arc<Host>>,
-    Json(body): Json<SettingsBody>,
-) -> Result<StatusCode, ApiError> {
+async fn set_settings(State(app): State<App>, Json(body): Json<SettingsBody>) -> ApiResult {
+    let host = app.host()?;
     {
         let mut config = host.config.lock().unwrap();
         if let Some(swap) = body.swap_cmd_ctrl {
@@ -275,10 +470,11 @@ struct PeerSettingsBody {
 }
 
 async fn set_peer_settings(
-    State(host): State<Arc<Host>>,
+    State(app): State<App>,
     Path(id): Path<String>,
     Json(body): Json<PeerSettingsBody>,
-) -> Result<StatusCode, ApiError> {
+) -> ApiResult {
+    let host = app.host()?;
     {
         let mut config = host.config.lock().unwrap();
         let peer = config
@@ -306,21 +502,12 @@ struct LockBody {
     locked: bool,
 }
 
-async fn set_lock(State(host): State<Arc<Host>>, Json(body): Json<LockBody>) -> StatusCode {
-    host.router.lock().unwrap().set_edge_locked(body.locked);
-    StatusCode::NO_CONTENT
-}
-
-async fn go_home(State(host): State<Arc<Host>>) -> StatusCode {
-    host.router.lock().unwrap().return_home();
-    StatusCode::NO_CONTENT
-}
-
-async fn retry_peer(
-    State(host): State<Arc<Host>>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    host.retry_peer(&id)?;
+async fn set_lock(State(app): State<App>, Json(body): Json<LockBody>) -> ApiResult {
+    app.host()?
+        .router
+        .lock()
+        .unwrap()
+        .set_edge_locked(body.locked);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -329,39 +516,52 @@ struct PauseBody {
     paused: bool,
 }
 
-async fn set_pause(State(host): State<Arc<Host>>, Json(body): Json<PauseBody>) -> StatusCode {
-    host.set_paused(body.paused);
-    StatusCode::NO_CONTENT
+async fn set_pause(State(app): State<App>, Json(body): Json<PauseBody>) -> ApiResult {
+    app.host()?.set_paused(body.paused);
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn check_update(State(host): State<Arc<Host>>) -> Result<Json<bool>, ApiError> {
-    Ok(Json(host.updater.check().await?))
+async fn go_home(State(app): State<App>) -> ApiResult {
+    app.host()?.router.lock().unwrap().return_home();
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn apply_update(State(host): State<Arc<Host>>) -> StatusCode {
+async fn check_update(State(app): State<App>) -> ApiResult<Json<bool>> {
+    Ok(Json(app.host()?.updater.check().await?))
+}
+
+async fn apply_update(State(app): State<App>) -> ApiResult {
+    let host = app.host()?.clone();
     tokio::spawn(async move {
         if let Err(err) = host.update_all().await {
             tracing::warn!("更新失败: {err:#}");
         }
     });
-    StatusCode::ACCEPTED
+    Ok(StatusCode::ACCEPTED)
 }
 
-async fn sync_version(State(host): State<Arc<Host>>, Path(id): Path<String>) -> StatusCode {
+async fn sync_version(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+    let host = app.host()?.clone();
     tokio::spawn(async move {
         if let Err(err) = host.sync_version(id).await {
             tracing::warn!("同步版本失败: {err:#}");
         }
     });
-    StatusCode::ACCEPTED
+    Ok(StatusCode::ACCEPTED)
 }
 
-async fn open_downloads() -> StatusCode {
-    let dir = files::default_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(&dir).spawn();
-    #[cfg(windows)]
-    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
-    StatusCode::NO_CONTENT
+// ---------------------------------------------------------------- 被控端
+
+async fn revoke_host(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+    app.client()?.revoke(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn copy_ticket(State(app): State<App>) -> ApiResult {
+    let ticket = app.client()?.ticket.clone();
+    tokio::task::spawn_blocking(move || {
+        arboard::Clipboard::new().and_then(|mut c| c.set_text(ticket))
+    })
+    .await??;
+    Ok(StatusCode::NO_CONTENT)
 }

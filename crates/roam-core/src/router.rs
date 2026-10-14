@@ -1,7 +1,10 @@
 //! 输入路由：决定每个本地输入事件留在主机还是发往某台被控设备。
 //!
-//! 运行在采集线程里（macOS 的事件 tap 回调），必须快，不做 I/O：
+//! 运行在采集线程里（macOS 的事件 tap 回调 / Windows 的低级钩子），必须快，不做 I/O：
 //! 发往被控设备的消息只是塞进通道，由网络任务发送。
+//!
+//! 布局是网格（见 [`crate::layout`]）：光标从某台设备的一边推出去，就进入那一边相邻格子里的设备，
+//! 位置沿边按比例对应。光标在被控设备上时，用该设备自己的本地坐标跟踪。
 
 use std::{
     collections::{HashMap, HashSet},
@@ -13,14 +16,14 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     keymap::{hid, remap_for_target},
-    layout::{DeviceGeom, DeviceId, RectExt, World},
-    settings::{DeviceSettings, EdgeMapping, Modifier, SwitchSettings},
+    layout::{DeviceGeom, DeviceId, World},
+    settings::{DeviceSettings, Modifier, SwitchSettings},
 };
 
 /// 采集层产生的本地输入事件（坐标为主机本地逻辑点）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputEvent {
-    /// `x, y` 为移动后的光标位置，`dx, dy` 为原始位移。
+    /// `x, y` 为移动后的光标位置，`dx, dy` 为位移。
     Move {
         x: f64,
         y: f64,
@@ -72,7 +75,7 @@ pub struct PeerLink {
 #[derive(Debug, Clone, PartialEq)]
 enum Focus {
     Local,
-    /// 光标在被控设备上，`cursor` 为全局坐标。
+    /// 光标在被控设备上，`cursor` 为该设备的本地坐标（逻辑点）。
     Remote {
         id: DeviceId,
         cursor: (f64, f64),
@@ -121,7 +124,7 @@ pub struct Router {
     /// 锁定在当前屏幕：不通过边缘切屏，快捷键仍然可用。
     edge_locked: bool,
     edge: EdgePush,
-    /// 每台被控设备上次离开时的光标位置（全局坐标），快捷键切回时用。
+    /// 每台被控设备上次离开时的光标位置（本地坐标），快捷键切回时用。
     last_remote_pos: HashMap<DeviceId, (f64, f64)>,
 }
 
@@ -292,32 +295,33 @@ impl Router {
             self.edge.current = None;
             return false;
         }
-        let Some(host) = self.world.find(&self.host_id) else {
+        let Some(host) = self.world.find(&self.host_id).cloned() else {
             return false;
         };
-        let (gx, gy) = host.to_global(x, y);
         // 只有光标已经顶在边缘、还在往外推时才考虑切屏
-        let probe = (gx + dx.signum() * EDGE_PROBE, gy + dy.signum() * EDGE_PROBE);
-        if host.contains_global(probe.0, probe.1) {
+        let probe = (x + dx.signum() * EDGE_PROBE, y + dy.signum() * EDGE_PROBE);
+        if host.contains(probe.0, probe.1) {
             self.edge.current = None;
             return false;
         }
-        let Some((target, _)) = self.world.device_near(probe.0, probe.1, &self.host_id) else {
+        let Some(side) = host.exit_side(probe.0, probe.1) else {
             self.edge.current = None;
             return false;
         };
-        if !self.peers.contains_key(&target.id) {
+        let Some(target) = self
+            .world
+            .neighbor(&self.host_id, side)
+            .filter(|d| self.peers.contains_key(&d.id))
+            .cloned()
+        else {
             self.edge.current = None;
             return false;
-        }
-        let target = target.clone();
-        let src = host
-            .nearest_display_global(gx, gy)
-            .expect("host has displays");
-        if !self.allow_switch(&target.id, src, (gx, gy), now) {
+        };
+        let src = host.nearest_display(x, y);
+        if !self.allow_switch(&target.id, src, (x, y), now) {
             return false;
         }
-        let entry = self.entry_point(src, &target, (gx, gy), (dx, dy));
+        let entry = host.entry_into(&target, side, x, y);
         self.cursor.set_locked(true);
         self.cursor.hide();
         self.enter_remote(target.id, entry);
@@ -336,31 +340,30 @@ impl Router {
             return;
         };
         let (cx, cy) = (cursor.0 + dx, cursor.1 + dy);
-        if current.contains_global(cx, cy) {
+        if current.contains(cx, cy) {
             self.edge.current = None;
             self.set_cursor(&id, (cx, cy));
             return;
         }
 
-        // 往当前设备外面推：看看边上有没有可以切过去的设备
-        let next = if self.edge_locked || !self.buttons_down.is_empty() {
-            None
-        } else {
-            self.world
-                .device_near(cx, cy, &id)
-                .map(|(d, _)| d.clone())
+        // 往当前设备外面推：看看这一边的格子里有没有可以切过去的设备
+        let clamped = current.clamp(cx, cy);
+        let next = match current.exit_side(cx, cy) {
+            Some(side) if !self.edge_locked && self.buttons_down.is_empty() => self
+                .world
+                .neighbor(&id, side)
                 .filter(|d| d.id == self.host_id || self.peers.contains_key(&d.id))
+                .cloned()
+                .map(|d| (side, d)),
+            _ => None,
         };
-        let src = current
-            .nearest_display_global(cursor.0, cursor.1)
-            .expect("device has displays");
+        let src = current.nearest_display(cursor.0, cursor.1);
         match next {
-            Some(next) if self.allow_switch(&next.id, src, cursor, now) => {
-                let entry = self.entry_point(src, &next, cursor, (dx, dy));
+            Some((side, next)) if self.allow_switch(&next.id, src, clamped, now) => {
+                let entry = current.entry_into(&next, side, clamped.0, clamped.1);
                 self.leave_remote();
                 if next.id == self.host_id {
-                    let (lx, ly) = next.to_local(entry.0, entry.1);
-                    self.enter_local(lx, ly);
+                    self.enter_local(entry.0, entry.1);
                 } else {
                     self.enter_remote(next.id, entry);
                 }
@@ -369,7 +372,6 @@ impl Router {
                 if next.is_none() {
                     self.edge.current = None;
                 }
-                let clamped = current.clamp_global(cx, cy);
                 self.set_cursor(&id, clamped);
             }
         }
@@ -422,35 +424,6 @@ impl Router {
         }
     }
 
-    /// 计算进入目标设备的位置（全局坐标）。
-    fn entry_point(
-        &self,
-        src: Rect,
-        target: &DeviceGeom,
-        (x, y): (f64, f64),
-        (dx, dy): (f64, f64),
-    ) -> (f64, f64) {
-        let raw = (x + dx, y + dy);
-        match self.settings.edge_mapping {
-            EdgeMapping::Aligned => target.clamp_global(raw.0, raw.1),
-            EdgeMapping::Proportional => {
-                let Some(td) = target.nearest_display_global(raw.0, raw.1) else {
-                    return raw;
-                };
-                if dx.abs() >= dy.abs() {
-                    // 穿过左右边：纵向按比例
-                    let t = ((y - src.y) / src.h).clamp(0.0, 1.0);
-                    let ny = td.y + t * (td.h - 1.0);
-                    td.clamp(raw.0, ny)
-                } else {
-                    let t = ((x - src.x) / src.w).clamp(0.0, 1.0);
-                    let nx = td.x + t * (td.w - 1.0);
-                    td.clamp(nx, raw.1)
-                }
-            }
-        }
-    }
-
     fn set_cursor(&mut self, id: &str, cursor: (f64, f64)) {
         self.focus = Focus::Remote {
             id: id.to_string(),
@@ -460,7 +433,6 @@ impl Router {
     }
 
     fn enter_remote(&mut self, id: DeviceId, cursor: (f64, f64)) {
-        let (x, y) = self.local_of(&id, cursor);
         self.focus = Focus::Remote {
             id: id.clone(),
             cursor,
@@ -468,8 +440,8 @@ impl Router {
         self.send(
             &id,
             Outbound::Stream(StreamMsg::Enter {
-                x: x as f32,
-                y: y as f32,
+                x: cursor.0 as f32,
+                y: cursor.1 as f32,
             }),
         );
     }
@@ -495,8 +467,7 @@ impl Router {
     fn host_center(&self) -> (f64, f64) {
         self.world
             .find(&self.host_id)
-            .and_then(|h| h.displays.first().copied())
-            .map(|d| (d.x + d.w / 2.0, d.y + d.h / 2.0))
+            .map(DeviceGeom::center)
             .unwrap_or((0.0, 0.0))
     }
 
@@ -522,14 +493,8 @@ impl Router {
             .last_remote_pos
             .get(&id)
             .copied()
-            .filter(|&(x, y)| target.contains_global(x, y))
-            .or_else(|| {
-                target
-                    .global_displays()
-                    .next()
-                    .map(|d| (d.x + d.w / 2.0, d.y + d.h / 2.0))
-            });
-        let Some(entry) = entry else { return };
+            .filter(|&(x, y)| target.contains(x, y))
+            .unwrap_or_else(|| target.center());
         if self.focused().is_some() {
             self.leave_remote();
         } else {
@@ -543,7 +508,7 @@ impl Router {
         let Focus::Remote { cursor, .. } = &self.focus else {
             return;
         };
-        let (x, y) = self.local_of(id, *cursor);
+        let (x, y) = *cursor;
         self.mouse_seq = self.mouse_seq.wrapping_add(1);
         let msg = Datagram::MouseAbs {
             seq: self.mouse_seq,
@@ -551,13 +516,6 @@ impl Router {
             y: y as f32,
         };
         self.send(id, Outbound::Datagram(msg));
-    }
-
-    fn local_of(&self, id: &str, (gx, gy): (f64, f64)) -> (f64, f64) {
-        self.world
-            .find(id)
-            .map(|d| d.to_local(gx, gy))
-            .unwrap_or((gx, gy))
     }
 
     fn on_button(&mut self, button: MouseButton, down: bool) -> bool {
@@ -571,12 +529,11 @@ impl Router {
         };
         if down {
             // 数据报可能丢，点击前用可靠流把位置再发一次，保证点在正确的地方
-            let (x, y) = self.local_of(&id, cursor);
             self.send(
                 &id,
                 Outbound::Stream(StreamMsg::MouseTo {
-                    x: x as f32,
-                    y: y as f32,
+                    x: cursor.0 as f32,
+                    y: cursor.1 as f32,
                 }),
             );
         }
@@ -712,7 +669,7 @@ mod tests {
     use tokio::sync::mpsc::{self, UnboundedReceiver};
 
     use super::*;
-    use crate::config::Point;
+    use crate::layout::Cell;
 
     #[derive(Debug, Clone, PartialEq)]
     enum CursorCall {
@@ -744,22 +701,22 @@ mod tests {
         Rect { x, y, w, h }
     }
 
-    /// Mac（1000×800）在左，Windows（1920×1080）紧贴在右。
+    fn geom(id: &str, w: f64, h: f64, col: i32, row: i32) -> DeviceGeom {
+        DeviceGeom {
+            id: id.into(),
+            displays: vec![rect(0.0, 0.0, w, h)],
+            cell: Cell { col, row },
+        }
+    }
+
+    /// Mac（1000×800）在中间格子，Windows（2000×1000）在右边相邻格子。
     fn setup() -> (Router, MockCursor, UnboundedReceiver<Outbound>) {
         let cursor = MockCursor::default();
         let mut router = Router::new("mac".into(), Os::MacOs, Box::new(cursor.clone()));
         router.set_world(World {
             devices: vec![
-                DeviceGeom {
-                    id: "mac".into(),
-                    displays: vec![rect(0.0, 0.0, 1000.0, 800.0)],
-                    pos: Point { x: 0.0, y: 0.0 },
-                },
-                DeviceGeom {
-                    id: "win".into(),
-                    displays: vec![rect(0.0, 0.0, 1920.0, 1080.0)],
-                    pos: Point { x: 1000.0, y: 0.0 },
-                },
+                geom("mac", 1000.0, 800.0, 2, 1),
+                geom("win", 2000.0, 1000.0, 3, 1),
             ],
         });
         let (tx, rx) = mpsc::unbounded_channel();
@@ -790,6 +747,15 @@ mod tests {
         base + Duration::from_millis(n)
     }
 
+    fn enter_of(msgs: &[Outbound]) -> (f32, f32) {
+        msgs.iter()
+            .find_map(|m| match m {
+                Outbound::Stream(StreamMsg::Enter { x, y }) => Some((*x, *y)),
+                _ => None,
+            })
+            .expect("expected Enter")
+    }
+
     #[test]
     fn stays_local_away_from_edge() {
         let (mut r, _, mut rx) = setup();
@@ -799,41 +765,49 @@ mod tests {
     }
 
     #[test]
-    fn crosses_right_edge_and_back() {
+    fn crosses_right_edge_proportionally_and_back() {
         let (mut r, cursor, mut rx) = setup();
+        // 在 Mac 右边 50% 高度推出去 → Windows 左边 50% 高度
         assert!(r.handle(mv(999.0, 400.0, 5.0, 0.0)));
         assert_eq!(r.focused(), Some("win"));
-        assert_eq!(
-            drain(&mut rx),
-            vec![Outbound::Stream(StreamMsg::Enter { x: 4.0, y: 400.0 })]
-        );
+        let (x, y) = enter_of(&drain(&mut rx));
+        assert_eq!(x, 0.0);
+        assert!((y - 500.0).abs() < 1.0, "y = {y}");
         assert_eq!(
             *cursor.0.lock().unwrap(),
             vec![CursorCall::Locked(true), CursorCall::Hide]
         );
 
+        // 在 Windows 上移动：发本地绝对坐标
         assert!(r.handle(mv(999.0, 400.0, 100.0, 50.0)));
-        assert_eq!(
-            drain(&mut rx),
-            vec![Outbound::Datagram(Datagram::MouseAbs {
-                seq: 1,
-                x: 104.0,
-                y: 450.0
-            })]
-        );
+        let Outbound::Datagram(Datagram::MouseAbs { x, y, .. }) = drain(&mut rx).remove(0) else {
+            panic!("expected MouseAbs");
+        };
+        assert_eq!(x, 100.0);
+        assert!((y - 550.0).abs() < 1.0);
 
+        // 往左推出 Windows 左边 → 回到 Mac 右边缘，高度按比例换算
         cursor.0.lock().unwrap().clear();
-        assert!(r.handle(mv(999.0, 400.0, -110.0, 0.0)));
+        assert!(r.handle(mv(999.0, 400.0, -200.0, 0.0)));
         assert_eq!(r.focused(), None);
         assert_eq!(drain(&mut rx), vec![Outbound::Stream(StreamMsg::Leave)]);
-        assert_eq!(
-            *cursor.0.lock().unwrap(),
-            vec![
-                CursorCall::Warp(994.0, 450.0),
-                CursorCall::Locked(false),
-                CursorCall::Show
-            ]
-        );
+        let calls = cursor.0.lock().unwrap().clone();
+        let CursorCall::Warp(wx, wy) = calls[0] else {
+            panic!("expected warp, got {calls:?}");
+        };
+        assert_eq!(wx, 999.0);
+        assert!((wy - 439.6).abs() < 1.0, "wy = {wy}");
+        assert_eq!(&calls[1..], [CursorCall::Locked(false), CursorCall::Show]);
+    }
+
+    #[test]
+    fn empty_neighbor_cell_blocks_crossing() {
+        let (mut r, _, _rx) = setup();
+        // 左边格子没有设备
+        assert!(!r.handle(mv(0.0, 400.0, -5.0, 0.0)));
+        // 往下推也没有
+        assert!(!r.handle(mv(500.0, 799.0, 0.0, 5.0)));
+        assert_eq!(r.focused(), None);
     }
 
     #[test]
@@ -841,16 +815,34 @@ mod tests {
         let (mut r, _, mut rx) = setup();
         r.handle(mv(999.0, 400.0, 5.0, 0.0));
         drain(&mut rx);
+        // Windows 右边没有设备：钳制在最右
         r.handle(mv(0.0, 0.0, 5000.0, 0.0));
         assert_eq!(r.focused(), Some("win"));
-        assert_eq!(
-            drain(&mut rx),
-            vec![Outbound::Datagram(Datagram::MouseAbs {
-                seq: 1,
-                x: 1919.0,
-                y: 400.0
-            })]
-        );
+        let Outbound::Datagram(Datagram::MouseAbs { x, .. }) = drain(&mut rx).remove(0) else {
+            panic!("expected MouseAbs");
+        };
+        assert_eq!(x, 1999.0);
+    }
+
+    #[test]
+    fn vertical_neighbor() {
+        let (mut r, _, mut rx) = setup();
+        let (tx, mut imac_rx) = mpsc::unbounded_channel();
+        r.set_world(World {
+            devices: vec![
+                geom("mac", 1000.0, 800.0, 2, 1),
+                geom("win", 2000.0, 1000.0, 3, 1),
+                geom("imac", 2560.0, 1440.0, 2, 0),
+            ],
+        });
+        r.add_peer("imac".into(), PeerLink { os: Os::MacOs, tx });
+        // 从 Mac 顶边 25% 处推上去 → iMac 底边 25% 处
+        assert!(r.handle(mv(250.0, 0.0, 0.0, -5.0)));
+        assert_eq!(r.focused(), Some("imac"));
+        let (x, y) = enter_of(&drain(&mut imac_rx));
+        assert!((x - 639.75).abs() < 1.0, "x = {x}");
+        assert_eq!(y, 1439.0);
+        assert!(drain(&mut rx).is_empty());
     }
 
     #[test]
@@ -923,7 +915,6 @@ mod tests {
         assert_eq!(r.focused(), None);
         assert_eq!(drain(&mut rx), vec![Outbound::Stream(StreamMsg::Leave)]);
         assert_eq!(cursor.0.lock().unwrap()[0], CursorCall::Warp(500.0, 400.0));
-        // Esc 的抬起也被吞掉，不会漏给任何一边
         assert!(r.handle(key(hid::ESCAPE, false)));
     }
 
@@ -931,29 +922,17 @@ mod tests {
     fn hotkey_digit_jumps_and_remembers_position() {
         let (mut r, _, mut rx) = setup();
         hold_hotkey_mods(&mut r);
-        // 组合 + 2 → 第二台设备（Windows），首次进入放在中央
         assert!(r.handle(key(DIGIT_1 + 1, true)));
         assert_eq!(r.focused(), Some("win"));
-        assert_eq!(
-            drain(&mut rx),
-            vec![Outbound::Stream(StreamMsg::Enter { x: 960.0, y: 540.0 })]
-        );
+        assert_eq!(enter_of(&drain(&mut rx)), (1000.0, 500.0));
         assert!(r.handle(key(DIGIT_1 + 1, false)));
 
         r.handle(mv(0.0, 0.0, 100.0, 0.0));
-        // 组合 + 1 → 回到主机
         assert!(r.handle(key(DIGIT_1, true)));
         assert_eq!(r.focused(), None);
         drain(&mut rx);
-        // 再切回去：回到上次离开的位置
         r.handle(key(DIGIT_1 + 1, true));
-        assert_eq!(
-            drain(&mut rx),
-            vec![Outbound::Stream(StreamMsg::Enter {
-                x: 1060.0,
-                y: 540.0
-            })]
-        );
+        assert_eq!(enter_of(&drain(&mut rx)), (1100.0, 500.0));
     }
 
     #[test]
@@ -978,7 +957,6 @@ mod tests {
         let t = Instant::now();
         assert!(!r.handle_at(mv(999.0, 400.0, 5.0, 0.0), t));
         assert!(!r.handle_at(mv(999.0, 400.0, 5.0, 0.0), ms(t, 150)));
-        // 中途离开边缘，计时重来
         r.handle_at(mv(990.0, 400.0, -5.0, 0.0), ms(t, 160));
         assert!(!r.handle_at(mv(999.0, 400.0, 5.0, 0.0), ms(t, 250)));
         assert!(r.handle_at(mv(999.0, 400.0, 5.0, 0.0), ms(t, 460)));
@@ -999,7 +977,6 @@ mod tests {
         assert!(r.handle_at(mv(999.0, 400.0, 9.0, 0.0), ms(t, 200)));
         assert_eq!(r.focused(), Some("win"));
 
-        // 两次撞边间隔太久不算
         let (mut r, _, _rx) = setup();
         r.set_switch_settings(SwitchSettings {
             double_tap: true,
@@ -1020,24 +997,8 @@ mod tests {
         });
         assert!(!r.handle(mv(999.0, 400.0, 5.0, 0.0)));
         r.handle(key(hid::LEFT_SHIFT, true));
-        // 右上角死区内不切
         assert!(!r.handle(mv(999.0, 10.0, 5.0, 0.0)));
         assert!(r.handle(mv(999.0, 400.0, 5.0, 0.0)));
-    }
-
-    #[test]
-    fn proportional_mapping() {
-        let (mut r, _, mut rx) = setup();
-        r.set_switch_settings(SwitchSettings {
-            edge_mapping: EdgeMapping::Proportional,
-            ..Default::default()
-        });
-        // Mac 高 800，从 y=400（50%）离开 → Windows 高 1080 的 50% 附近
-        r.handle(mv(999.0, 400.0, 5.0, 0.0));
-        let Outbound::Stream(StreamMsg::Enter { y, .. }) = drain(&mut rx).remove(0) else {
-            panic!("expected Enter");
-        };
-        assert!((y - 539.5).abs() < 1.0, "y = {y}");
     }
 
     #[test]
@@ -1055,14 +1016,10 @@ mod tests {
         r.handle(mv(999.0, 400.0, 5.0, 0.0));
         drain(&mut rx);
         r.handle(mv(0.0, 0.0, 10.0, 0.0));
-        assert_eq!(
-            drain(&mut rx),
-            vec![Outbound::Datagram(Datagram::MouseAbs {
-                seq: 1,
-                x: 24.0,
-                y: 400.0
-            })]
-        );
+        let Outbound::Datagram(Datagram::MouseAbs { x, .. }) = drain(&mut rx).remove(0) else {
+            panic!("expected MouseAbs");
+        };
+        assert_eq!(x, 20.0);
         assert!(r.handle(InputEvent::WheelLines { dx: 240, dy: 240 }));
         assert_eq!(
             drain(&mut rx),
@@ -1071,7 +1028,6 @@ mod tests {
                 dy: -120
             })]
         );
-        // 在主机上滚动不受影响
         r.return_home();
         assert!(!r.handle(InputEvent::WheelLines { dx: 0, dy: 120 }));
     }

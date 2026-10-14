@@ -27,18 +27,6 @@ impl Modifier {
     }
 }
 
-/// 光标跨屏时，进入位置如何计算。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EdgeMapping {
-    /// 按布局里的实际位置一一对应。
-    #[default]
-    Aligned,
-    /// 按边的比例对应：从源屏幕边的 30% 处离开，就从目标屏幕边的 30% 处进入。
-    /// 两块屏幕大小差别很大时更顺手。
-    Proportional,
-}
-
 /// 全局切屏设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -53,7 +41,6 @@ pub struct SwitchSettings {
     pub require_modifier: Option<Modifier>,
     /// 屏幕四角的死区大小（逻辑点），角落附近不切屏。
     pub corner_deadzone: f64,
-    pub edge_mapping: EdgeMapping,
     /// 快捷键的修饰组合：组合 + Esc 回到本机，组合 + 数字直切设备，组合 + L 锁定当前屏幕。
     pub hotkey_modifiers: Vec<Modifier>,
 }
@@ -66,7 +53,6 @@ impl Default for SwitchSettings {
             double_tap_window_ms: 500,
             require_modifier: None,
             corner_deadzone: 0.0,
-            edge_mapping: EdgeMapping::Aligned,
             hotkey_modifiers: vec![Modifier::Ctrl, Modifier::Alt, Modifier::Cmd],
         }
     }

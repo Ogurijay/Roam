@@ -13,7 +13,7 @@ use iroh::{
 };
 use roam_core::{
     config::{Config, Peer, Store},
-    layout::{DeviceGeom, World, default_position},
+    layout::{Cell, DeviceGeom, HOST_CELL, World, default_cell},
     net::{PathKind, selected_path},
     router::{CursorControl, Outbound, PeerLink, Router},
     ticket,
@@ -269,44 +269,51 @@ impl Host {
         let mut config = self.config.lock().unwrap();
         let status = self.status.lock().unwrap();
 
-        let mut placed: Vec<DeviceGeom> = Vec::new();
+        // 每台设备都在网格里有一个格子（包括还没连上过的设备），缺的补上
         let mut changed = false;
-        let mut entries: Vec<(String, Vec<DisplayInfo>)> =
-            vec![(self.host_id.clone(), self.displays.clone())];
-        entries.extend(
-            config
-                .peers
-                .iter()
-                .filter(|p| !p.displays.is_empty() && p.settings.enabled)
-                .map(|p| (p.id.clone(), p.displays.clone())),
-        );
-        for (id, displays) in entries {
-            let pos = match config.layout.get(&id) {
-                Some(pos) => *pos,
-                None => {
-                    let pos = default_position(&placed);
-                    config.layout.insert(id.clone(), pos);
-                    changed = true;
-                    pos
-                }
-            };
-            placed.push(DeviceGeom {
-                id,
-                displays: displays.iter().map(|d| d.rect).collect(),
-                pos,
-            });
+        let host_cell = *config.grid.entry(self.host_id.clone()).or_insert_with(|| {
+            changed = true;
+            HOST_CELL
+        });
+        let peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+        for id in &peer_ids {
+            if !config.grid.contains_key(id) {
+                let taken: Vec<Cell> = config.grid.values().copied().collect();
+                config
+                    .grid
+                    .insert(id.clone(), default_cell(&taken, host_cell));
+                changed = true;
+            }
         }
+        config
+            .grid
+            .retain(|id, _| *id == self.host_id || peer_ids.contains(id));
         if changed && let Err(err) = self.store.save(&config) {
             tracing::warn!("保存配置失败: {err:#}");
         }
 
-        // 只有主机和在线设备参与切屏
-        let world = World {
-            devices: placed
-                .into_iter()
-                .filter(|d| d.id == self.host_id || status.get(&d.id).is_some_and(|s| s.online))
-                .collect(),
-        };
+        // 只有主机和在线、已启用的设备参与切屏
+        let mut devices = vec![DeviceGeom {
+            id: self.host_id.clone(),
+            displays: self.displays.iter().map(|d| d.rect).collect(),
+            cell: host_cell,
+        }];
+        devices.extend(
+            config
+                .peers
+                .iter()
+                .filter(|p| {
+                    p.settings.enabled
+                        && !p.displays.is_empty()
+                        && status.get(&p.id).is_some_and(|s| s.online)
+                })
+                .map(|p| DeviceGeom {
+                    id: p.id.clone(),
+                    displays: p.displays.iter().map(|d| d.rect).collect(),
+                    cell: config.grid[&p.id],
+                }),
+        );
+        let world = World { devices };
         drop(status);
         let mut router = self.router.lock().unwrap();
         router.set_swap_cmd_ctrl(config.swap_cmd_ctrl);
@@ -328,6 +335,29 @@ impl Host {
         );
         drop(config);
         router.set_world(world);
+    }
+
+    /// 把设备挪到某个格子；格子里已有设备时两者交换。
+    pub fn move_device(&self, id: &str, cell: Cell) -> Result<()> {
+        if !cell.in_grid() {
+            bail!("格子超出范围");
+        }
+        {
+            let mut config = self.config.lock().unwrap();
+            let old = *config.grid.get(id).context("没有这台设备")?;
+            let other = config
+                .grid
+                .iter()
+                .find(|(other, c)| **c == cell && *other != id)
+                .map(|(other, _)| other.clone());
+            if let Some(other) = other {
+                config.grid.insert(other, old);
+            }
+            config.grid.insert(id.to_string(), cell);
+        }
+        self.save_config()?;
+        self.rebuild_world();
+        Ok(())
     }
 
     pub fn add_peer(self: &Arc<Self>, code: &str, name: Option<String>) -> Result<String> {
@@ -368,7 +398,7 @@ impl Host {
         {
             let mut config = self.config.lock().unwrap();
             config.peers.retain(|p| p.id != id);
-            config.layout.remove(id);
+            config.grid.remove(id);
         }
         self.save_config()?;
         self.rebuild_world();
@@ -408,13 +438,43 @@ impl Host {
             if denied {
                 return;
             }
-            tokio::time::sleep(backoff).await;
+            // 等待重连；局域网里发现对方换了地址（例如重启）就立刻重试
+            let known = self
+                .config
+                .lock()
+                .unwrap()
+                .peers
+                .iter()
+                .find(|p| p.id == peer.id)
+                .map(|p| p.ticket.clone());
+            let deadline = tokio::time::Instant::now() + backoff;
+            while tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let fresh = self.nearby.get(&peer.id).map(|d| d.ticket);
+                if fresh.is_some() && fresh != known {
+                    tracing::info!("发现「{}」的新地址，立即重连", peer.name);
+                    break;
+                }
+            }
             backoff = (backoff * 2).min(Duration::from_secs(10));
         }
     }
 
     async fn peer_session(&self, peer: &Peer) -> Result<()> {
-        let addr = ticket::decode(&peer.ticket)?;
+        // 保存的连接码里的地址可能已经过时（对方重启换了端口、IP 变了），
+        // 局域网里发现了这台设备时优先用它广播的最新连接码
+        let fresh = self
+            .nearby
+            .get(&peer.id)
+            .map(|d| d.ticket)
+            .filter(|t| *t != peer.ticket);
+        if let Some(fresh) = &fresh {
+            if let Some(p) = self.config.lock().unwrap().peer_mut(&peer.id) {
+                p.ticket = fresh.clone();
+            }
+            let _ = self.save_config();
+        }
+        let addr = ticket::decode(fresh.as_deref().unwrap_or(&peer.ticket))?;
         let conn = tokio::time::timeout(Duration::from_secs(15), self.endpoint.connect(addr, ALPN))
             .await
             .context("连接超时：对方可能没有运行 Roam，或网络不通")??;
@@ -792,10 +852,10 @@ impl Host {
 }
 
 /// 没有光标控制能力的平台（非 macOS 主机，仅用于布局预览和演示）。
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub struct NoopCursor;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 impl CursorControl for NoopCursor {
     fn hide(&mut self) {}
     fn show(&mut self) {}

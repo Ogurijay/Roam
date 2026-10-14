@@ -27,6 +27,9 @@ use windows_sys::Win32::{
     },
 };
 
+/// 标记自己注入的事件（dwExtraInfo），本机的采集钩子看到后会忽略。
+pub const INJECTED_MARK: usize = 0x524F_414D;
+
 /// 一个 WHEEL_DELTA 大约对应多少像素（Windows 默认一格滚 3 行）。
 const PIXELS_PER_NOTCH: f32 = 48.0;
 
@@ -238,7 +241,7 @@ impl Injector {
                     wScan: scan,
                     dwFlags: flags,
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: INJECTED_MARK,
                 },
             },
         };
@@ -310,7 +313,7 @@ fn send_mouse(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) {
                 mouseData: data,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: INJECTED_MARK,
             },
         },
     };
@@ -328,5 +331,329 @@ fn send(inputs: &[INPUT]) {
     if sent as usize != inputs.len() {
         // 常见原因：目标窗口是管理员权限（UIPI），或处于锁屏 / UAC 安全桌面
         tracing::debug!("SendInput 被系统拦截");
+    }
+}
+
+// ---------------------------------------------------------------- 采集（主机）
+
+use std::sync::{
+    Mutex as StdMutex,
+    atomic::{AtomicBool, AtomicI32, Ordering},
+};
+
+use roam_core::{
+    keymap::win_to_hid,
+    router::{CursorControl, InputEvent},
+};
+use windows_sys::Win32::{
+    Foundation::{LRESULT, POINT, WPARAM},
+    System::LibraryLoader::GetModuleHandleW,
+    UI::WindowsAndMessaging::{
+        CallNextHookEx, CreateCursor, DispatchMessageW, GetCursorPos, GetMessageW, KBDLLHOOKSTRUCT,
+        LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING,
+        OCR_CROSS, OCR_HAND, OCR_IBEAM, OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS,
+        OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT, SPI_SETCURSORS, SetCursorPos, SetSystemCursor,
+        SetWindowsHookExW, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
+        WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+        WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    },
+};
+
+type Handler = Box<dyn FnMut(InputEvent) -> bool + Send>;
+
+/// 钩子回调没有用户数据参数，只能用全局状态。
+static HANDLER: StdMutex<Option<Handler>> = StdMutex::new(None);
+static MONITORS: StdMutex<Vec<Monitor>> = StdMutex::new(Vec::new());
+/// 锁定时光标停在这里（物理像素），每次移动都算出相对这里的位移，再把事件吞掉。
+static LOCKED: AtomicBool = AtomicBool::new(false);
+static PARK_X: AtomicI32 = AtomicI32::new(0);
+static PARK_Y: AtomicI32 = AtomicI32::new(0);
+static LAST_X: AtomicI32 = AtomicI32::new(i32::MIN);
+static LAST_Y: AtomicI32 = AtomicI32::new(0);
+/// 测试用：接受其他程序注入的输入（平时忽略，避免和远程控制软件互相干扰）。
+static ACCEPT_INJECTED: AtomicBool = AtomicBool::new(false);
+
+fn monitors_snapshot() -> Vec<Monitor> {
+    let mut cached = MONITORS.lock().unwrap();
+    if cached.is_empty() {
+        *cached = monitors();
+    }
+    cached.clone()
+}
+
+/// 物理像素 → 逻辑点（返回所在显示器的缩放比例）。
+fn pixel_to_logical(px: i32, py: i32) -> (f64, f64, f64) {
+    let mons = monitors_snapshot();
+    let inside = |m: &&Monitor| {
+        px >= m.pixel.left && px < m.pixel.right && py >= m.pixel.top && py < m.pixel.bottom
+    };
+    let Some(m) = mons.iter().find(inside).or_else(|| mons.first()) else {
+        return (px as f64, py as f64, 1.0);
+    };
+    (
+        m.logical.x + (px - m.pixel.left) as f64 / m.scale,
+        m.logical.y + (py - m.pixel.top) as f64 / m.scale,
+        m.scale,
+    )
+}
+
+fn logical_to_pixel(x: f64, y: f64) -> (i32, i32) {
+    let mons = monitors_snapshot();
+    let nearest = mons.iter().min_by(|a, b| {
+        let d = |m: &Monitor| {
+            let cx = x.clamp(m.logical.x, m.logical.x + m.logical.w);
+            let cy = y.clamp(m.logical.y, m.logical.y + m.logical.h);
+            (cx - x).powi(2) + (cy - y).powi(2)
+        };
+        d(a).total_cmp(&d(b))
+    });
+    let Some(m) = nearest else {
+        return (x as i32, y as i32);
+    };
+    (
+        m.pixel.left + ((x - m.logical.x) * m.scale).round() as i32,
+        m.pixel.top + ((y - m.logical.y) * m.scale).round() as i32,
+    )
+}
+
+fn dispatch(ev: InputEvent) -> bool {
+    match HANDLER.lock() {
+        Ok(mut guard) => guard.as_mut().is_some_and(|h| h(ev)),
+        Err(_) => false,
+    }
+}
+
+unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code < 0 {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+    let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+    let ours = info.dwExtraInfo == INJECTED_MARK;
+    let injected = info.flags & LLMHF_INJECTED != 0;
+    if ours || (injected && !ACCEPT_INJECTED.load(Ordering::Relaxed)) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
+    let wheel = (info.mouseData >> 16) as i16 as i32;
+    let event = match wparam as u32 {
+        WM_MOUSEMOVE => {
+            let (px, py) = (info.pt.x, info.pt.y);
+            let (lx, ly, scale) = pixel_to_logical(px, py);
+            let (dx, dy) = if LOCKED.load(Ordering::Relaxed) {
+                let (ox, oy) = (
+                    PARK_X.load(Ordering::Relaxed),
+                    PARK_Y.load(Ordering::Relaxed),
+                );
+                ((px - ox) as f64 / scale, (py - oy) as f64 / scale)
+            } else {
+                let last_x = LAST_X.load(Ordering::Relaxed);
+                let d = if last_x == i32::MIN {
+                    (0.0, 0.0)
+                } else {
+                    (
+                        (px - last_x) as f64 / scale,
+                        (py - LAST_Y.load(Ordering::Relaxed)) as f64 / scale,
+                    )
+                };
+                LAST_X.store(px, Ordering::Relaxed);
+                LAST_Y.store(py, Ordering::Relaxed);
+                d
+            };
+            Some(InputEvent::Move {
+                x: lx,
+                y: ly,
+                dx,
+                dy,
+            })
+        }
+        WM_LBUTTONDOWN => Some(button_event(MouseButton::Left, true)),
+        WM_LBUTTONUP => Some(button_event(MouseButton::Left, false)),
+        WM_RBUTTONDOWN => Some(button_event(MouseButton::Right, true)),
+        WM_RBUTTONUP => Some(button_event(MouseButton::Right, false)),
+        WM_MBUTTONDOWN => Some(button_event(MouseButton::Middle, true)),
+        WM_MBUTTONUP => Some(button_event(MouseButton::Middle, false)),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            let down = wparam as u32 == WM_XBUTTONDOWN;
+            let button = if wheel == 1 {
+                MouseButton::Back
+            } else {
+                MouseButton::Forward
+            };
+            Some(button_event(button, down))
+        }
+        WM_MOUSEWHEEL => Some(InputEvent::WheelLines { dx: 0, dy: wheel }),
+        WM_MOUSEHWHEEL => Some(InputEvent::WheelLines { dx: wheel, dy: 0 }),
+        _ => None,
+    };
+
+    let swallow = event.is_some_and(dispatch);
+    // 锁定期间所有鼠标事件都吞掉，光标就一直停在原地
+    if swallow || LOCKED.load(Ordering::Relaxed) {
+        1
+    } else {
+        unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    }
+}
+
+fn button_event(button: MouseButton, down: bool) -> InputEvent {
+    InputEvent::Button { button, down }
+}
+
+unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code < 0 {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+    let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+    let ours = info.dwExtraInfo == INJECTED_MARK;
+    let injected = info.flags & LLKHF_INJECTED != 0;
+    if ours || (injected && !ACCEPT_INJECTED.load(Ordering::Relaxed)) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+    let down = match wparam as u32 {
+        WM_KEYDOWN | WM_SYSKEYDOWN => true,
+        WM_KEYUP | WM_SYSKEYUP => false,
+        _ => return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) },
+    };
+    const VK_NUMLOCK: u32 = 0x90;
+    const VK_PAUSE: u32 = 0x13;
+    let usage = match info.vkCode {
+        VK_NUMLOCK => Some(0x53),
+        VK_PAUSE => None,
+        _ => win_to_hid(info.scanCode as u16, info.flags & LLKHF_EXTENDED != 0),
+    };
+    let swallow = usage.is_some_and(|usage| dispatch(InputEvent::Key { usage, down }));
+    if swallow {
+        1
+    } else {
+        unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    }
+}
+
+/// 安装键鼠钩子并在当前线程运行消息循环（不返回）。
+///
+/// `handler` 对每个输入事件返回 `true` 表示吞掉（不交给 Windows）。
+pub fn run_capture(handler: impl FnMut(InputEvent) -> bool + Send + 'static) -> anyhow::Result<()> {
+    ACCEPT_INJECTED.store(
+        std::env::var_os("ROAM_ACCEPT_INJECTED").is_some(),
+        Ordering::Relaxed,
+    );
+    *MONITORS.lock().unwrap() = monitors();
+    *HANDLER.lock().unwrap() = Some(Box::new(handler));
+    let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+    let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), module, 0) };
+    let keyboard = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) };
+    if mouse.is_null() || keyboard.is_null() {
+        anyhow::bail!("无法安装键鼠钩子");
+    }
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    unsafe {
+        UnhookWindowsHookEx(mouse);
+        UnhookWindowsHookEx(keyboard);
+    }
+    Ok(())
+}
+
+/// 恢复系统光标（隐藏光标是通过替换系统光标实现的）。启动时也调用一次，防止上次异常退出后光标不见了。
+pub fn restore_cursors() {
+    unsafe {
+        SystemParametersInfoW(SPI_SETCURSORS, 0, std::ptr::null_mut(), 0);
+    }
+}
+
+/// 主机光标控制。
+pub struct WinCursor {
+    hidden: bool,
+}
+
+impl WinCursor {
+    pub fn new() -> Self {
+        restore_cursors();
+        Self { hidden: false }
+    }
+}
+
+impl Default for WinCursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for WinCursor {
+    fn drop(&mut self) {
+        restore_cursors();
+    }
+}
+
+impl CursorControl for WinCursor {
+    fn hide(&mut self) {
+        if self.hidden {
+            return;
+        }
+        self.hidden = true;
+        // 把各种系统光标都换成全透明光标
+        let and_mask = [0xFFu8; 32 * 4];
+        let xor_mask = [0u8; 32 * 4];
+        let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+        for id in [
+            OCR_NORMAL,
+            OCR_IBEAM,
+            OCR_WAIT,
+            OCR_CROSS,
+            OCR_UP,
+            OCR_SIZENWSE,
+            OCR_SIZENESW,
+            OCR_SIZEWE,
+            OCR_SIZENS,
+            OCR_SIZEALL,
+            OCR_NO,
+            OCR_HAND,
+            OCR_APPSTARTING,
+        ] {
+            unsafe {
+                let blank = CreateCursor(
+                    module,
+                    0,
+                    0,
+                    32,
+                    32,
+                    and_mask.as_ptr().cast(),
+                    xor_mask.as_ptr().cast(),
+                );
+                if !blank.is_null() {
+                    SetSystemCursor(blank, id);
+                }
+            }
+        }
+    }
+
+    fn show(&mut self) {
+        if self.hidden {
+            self.hidden = false;
+            restore_cursors();
+        }
+    }
+
+    fn warp(&mut self, x: f64, y: f64) {
+        let (px, py) = logical_to_pixel(x, y);
+        unsafe { SetCursorPos(px, py) };
+        LAST_X.store(px, Ordering::Relaxed);
+        LAST_Y.store(py, Ordering::Relaxed);
+    }
+
+    fn set_locked(&mut self, locked: bool) {
+        if locked {
+            let mut pt = POINT { x: 0, y: 0 };
+            unsafe { GetCursorPos(&mut pt) };
+            PARK_X.store(pt.x, Ordering::Relaxed);
+            PARK_Y.store(pt.y, Ordering::Relaxed);
+        }
+        LOCKED.store(locked, Ordering::Relaxed);
     }
 }

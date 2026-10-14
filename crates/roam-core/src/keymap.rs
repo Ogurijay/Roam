@@ -145,6 +145,17 @@ pub fn mac_to_hid(keycode: u16) -> Option<u16> {
     Some(usage)
 }
 
+/// HID → macOS kVK（[`mac_to_hid`] 的反查）。
+pub fn hid_to_mac(usage: u16) -> Option<u16> {
+    (0u16..0x80).find(|&code| mac_to_hid(code) == Some(usage))
+}
+
+/// Windows 低级键盘钩子给出的扫描码 → HID（[`hid_to_win`] 的反查）。
+pub fn win_to_hid(scan: u16, extended: bool) -> Option<u16> {
+    // 非美式键盘的反斜杠与 # 共用扫描码 0x2B，统一当作反斜杠
+    (0u16..0xE8).find(|&usage| usage != 0x32 && hid_to_win(usage) == Some((scan, extended)))
+}
+
 /// macOS 修饰键的"设备相关"标志位（区分左右），用于在 FlagsChanged 事件中判断按下还是抬起。
 pub fn mac_modifier_flag(keycode: u16) -> Option<u64> {
     Some(match keycode {
@@ -269,10 +280,10 @@ pub fn hid_to_win(usage: u16) -> Option<(u16, bool)> {
     Some((scan, ext))
 }
 
-/// 控制端到被控端的修饰键转换：Mac 控制 Windows 时 Cmd ↔ Ctrl 对调，
-/// 这样 Cmd+C / Cmd+V 在 Windows 上就是 Ctrl+C / Ctrl+V。
+/// 控制端到被控端的修饰键转换：Mac 和其他系统互控时 Cmd ↔ Ctrl 对调。
+/// Mac 控制 Windows：Cmd+C → Ctrl+C；Windows 控制 Mac：Ctrl+C → Cmd+C。
 pub fn remap_for_target(usage: u16, from: Os, to: Os, swap_cmd_ctrl: bool) -> u16 {
-    if !swap_cmd_ctrl || from != Os::MacOs || to == Os::MacOs {
+    if !swap_cmd_ctrl || (from == Os::MacOs) == (to == Os::MacOs) {
         return usage;
     }
     match usage {
@@ -318,6 +329,22 @@ mod tests {
     }
 
     #[test]
+    fn reverse_tables_roundtrip() {
+        for code in 0u16..0x80 {
+            if let Some(usage) = mac_to_hid(code) {
+                assert_eq!(hid_to_mac(usage), Some(code), "kVK {code:#x}");
+            }
+        }
+        // A、左 Ctrl、右 Alt、方向键
+        assert_eq!(win_to_hid(0x1E, false), Some(0x04));
+        assert_eq!(win_to_hid(0x1D, false), Some(hid::LEFT_CTRL));
+        assert_eq!(win_to_hid(0x38, true), Some(hid::RIGHT_ALT));
+        assert_eq!(win_to_hid(0x48, true), Some(0x52));
+        assert_eq!(win_to_hid(0x48, false), Some(0x60)); // 小键盘 8
+        assert_eq!(win_to_hid(0x2B, false), Some(0x31));
+    }
+
+    #[test]
     fn cmd_becomes_ctrl_on_windows() {
         let r = |u| remap_for_target(u, Os::MacOs, Os::Windows, true);
         assert_eq!(r(hid::LEFT_GUI), hid::LEFT_CTRL);
@@ -330,6 +357,15 @@ mod tests {
         assert_eq!(
             remap_for_target(hid::LEFT_GUI, Os::MacOs, Os::MacOs, true),
             hid::LEFT_GUI
+        );
+        // Windows 控制 Mac：Ctrl → Cmd；同为 Windows 不变
+        assert_eq!(
+            remap_for_target(hid::LEFT_CTRL, Os::Windows, Os::MacOs, true),
+            hid::LEFT_GUI
+        );
+        assert_eq!(
+            remap_for_target(hid::LEFT_CTRL, Os::Windows, Os::Windows, true),
+            hid::LEFT_CTRL
         );
     }
 }

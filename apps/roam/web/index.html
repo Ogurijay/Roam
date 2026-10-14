@@ -3,997 +3,643 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Roam · 屏幕布局</title>
+<title>Roam</title>
 <style>
   :root {
-    --bg: #f5f6f8;
+    --bg: #f3f4f6;
     --panel: #ffffff;
-    --border: #e3e5ea;
+    --sunken: #f7f8fa;
+    --border: #e2e5ea;
     --text: #1d2129;
     --muted: #6b7280;
-    --grid: rgba(15, 23, 42, 0.05);
     --accent: #2563eb;
-    --accent-soft: rgba(37, 99, 235, 0.12);
+    --accent-soft: rgba(37, 99, 235, 0.10);
     --peer: #0d9488;
     --peer-soft: rgba(13, 148, 136, 0.12);
-    --offline: #9ca3af;
+    --offline: #a3a9b5;
     --ok: #16a34a;
     --warn-bg: #fff7e6;
     --warn-border: #f5c26b;
     --warn-text: #8a5a00;
     --danger: #dc2626;
-    --shadow: 0 1px 2px rgba(0,0,0,.06), 0 4px 16px rgba(0,0,0,.06);
+    --cell: #eceef2;
+    --radius: 10px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #111318;
-      --panel: #1a1d24;
-      --border: #2a2f3a;
+      --bg: #16181d;
+      --panel: #1e2128;
+      --sunken: #191c22;
+      --border: #2c313b;
       --text: #e6e8ec;
-      --muted: #8b93a3;
-      --grid: rgba(255, 255, 255, 0.04);
+      --muted: #8d95a5;
       --accent: #5b8cff;
-      --accent-soft: rgba(91, 140, 255, 0.16);
+      --accent-soft: rgba(91, 140, 255, 0.15);
       --peer: #2dd4bf;
       --peer-soft: rgba(45, 212, 191, 0.14);
-      --offline: #5b6272;
+      --offline: #586071;
       --warn-bg: #2b2414;
       --warn-border: #6b5520;
       --warn-text: #f2c66d;
-      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 16px rgba(0,0,0,.3);
+      --cell: #23272f;
     }
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
-  html, body { height: 100%; margin: 0; }
+  html, body { margin: 0; height: 100%; }
   body {
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    display: flex;
-    flex-direction: column;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column; overflow: hidden;
+    user-select: none;
   }
-  header {
-    display: flex; align-items: center; gap: 12px;
-    padding: 12px 20px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-  }
-  .brand { font-weight: 700; font-size: 16px; letter-spacing: .3px; }
-  .brand small { font-weight: 400; color: var(--muted); margin-left: 8px; font-size: 13px; }
-  .spacer { flex: 1; }
-  .pill {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 3px 10px; border-radius: 999px;
-    font-size: 12px; border: 1px solid var(--border); color: var(--muted);
-  }
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--offline); flex: none; }
-  .dot.on { background: var(--ok); }
-  .pill.focus { border-color: var(--peer); color: var(--peer); background: var(--peer-soft); }
+  input, textarea { user-select: text; }
   button {
-    font: inherit; cursor: pointer;
-    border: 1px solid var(--border); background: var(--panel); color: var(--text);
-    padding: 5px 12px; border-radius: 7px;
+    font: inherit; cursor: pointer; color: var(--text);
+    background: var(--panel); border: 1px solid var(--border);
+    padding: 4px 12px; border-radius: 7px;
   }
   button:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button.primary:hover { filter: brightness(1.08); color: #fff; }
-  button.link { border: none; background: none; padding: 2px 4px; color: var(--muted); font-size: 12px; }
-  button.link:hover { color: var(--danger); }
-
-  .banner {
-    margin: 12px 20px 0; padding: 10px 14px; border-radius: 8px;
-    background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-text);
-    white-space: pre-line; font-size: 13px;
+  button.link { border: none; background: none; padding: 0 2px; color: var(--accent); }
+  button.danger:hover { color: var(--danger); border-color: var(--danger); }
+  button.on { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-text); }
+  input[type=text], textarea, select {
+    font: inherit; color: var(--text); background: var(--sunken);
+    border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px; width: 100%;
   }
-
-  main { flex: 1; display: flex; min-height: 0; }
-  #stage {
-    flex: 1; position: relative; overflow: hidden; margin: 16px; border-radius: 12px;
-    background-color: var(--panel); border: 1px solid var(--border);
-    background-image:
-      linear-gradient(var(--grid) 1px, transparent 1px),
-      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
-    background-size: 24px 24px;
-  }
-  #stage .hint {
-    position: absolute; left: 16px; bottom: 12px; color: var(--muted); font-size: 12px;
-    pointer-events: none;
-  }
-  #stage .empty {
-    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    color: var(--muted); text-align: center; padding: 40px;
-  }
-  .device { position: absolute; cursor: grab; user-select: none; touch-action: none; }
-  #stage.ready .device { transition: left .25s ease, top .25s ease, width .25s ease, height .25s ease; }
-  .device.dragging { cursor: grabbing; transition: none; z-index: 10; }
-  .device.dragging .screen { box-shadow: 0 8px 28px rgba(0,0,0,.18); }
-  .screen {
-    position: absolute; border-radius: 6px;
-    border: 2px solid var(--peer); background: var(--peer-soft);
-    box-shadow: var(--shadow);
-  }
-  .device.host .screen { border-color: var(--accent); background: var(--accent-soft); }
-  .device.offline .screen { border-color: var(--offline); border-style: dashed; background: transparent; box-shadow: none; }
-  .device.focused .screen { box-shadow: 0 0 0 4px var(--peer-soft), var(--shadow); }
-  .label {
-    position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
-    text-align: center; pointer-events: none; padding: 0 6px; overflow: hidden;
-  }
-  .label .name { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .label .meta { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ghost {
-    position: absolute; border: 2px dashed var(--accent); border-radius: 6px;
-    pointer-events: none; transition: left .08s, top .08s;
-  }
-  .edge {
-    position: absolute; z-index: 5; pointer-events: none; border-radius: 3px;
-    background: #22c55e; box-shadow: 0 0 0 2px rgba(34,197,94,.25), 0 0 12px rgba(34,197,94,.6);
-  }
-
-  aside {
-    width: 340px; flex: none; overflow-y: auto;
-    padding: 16px 16px 24px 0;
-  }
-  section {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-    padding: 14px 16px; margin-bottom: 12px;
-  }
-  section h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
-  .item { display: flex; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
-  .item:first-of-type { border-top: none; padding-top: 0; }
-  .item .body { flex: 1; min-width: 0; }
-  .item .title { display: flex; align-items: center; gap: 6px; font-weight: 600; }
-  .item .title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .item .sub { color: var(--muted); font-size: 12px; }
-  .item .err { color: var(--danger); font-size: 12px; word-break: break-all; }
-  .badge {
-    font-size: 11px; font-weight: 500; padding: 0 6px; border-radius: 4px;
-    background: var(--accent-soft); color: var(--accent); flex: none;
-  }
-  .badge.peer { background: var(--peer-soft); color: var(--peer); }
-  textarea, input[type=text] {
-    width: 100%; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
-    color: var(--text); background: var(--bg); border: 1px solid var(--border);
-    border-radius: 7px; padding: 7px 9px; margin-bottom: 8px; resize: vertical;
-  }
-  input[type=text] { font-family: inherit; font-size: 13px; }
-  textarea:focus, input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
-  label.toggle { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
-  label.toggle input { margin-top: 3px; }
-  .muted { color: var(--muted); font-size: 12px; }
+  textarea { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; resize: none; }
+  input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  input[type=checkbox] { accent-color: var(--accent); }
   kbd {
     font: 11px ui-monospace, Menlo, Consolas, monospace; padding: 1px 5px; border-radius: 4px;
-    border: 1px solid var(--border); background: var(--bg);
+    border: 1px solid var(--border); background: var(--sunken);
   }
-  .pairing {
-    margin: 12px 20px 0; padding: 14px 18px; border-radius: 10px;
-    background: var(--accent-soft); border: 1px solid var(--accent); color: var(--text);
-    display: flex; align-items: center; gap: 16px;
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--offline); flex: none; }
+  .dot.on { background: var(--ok); }
+  .dot.wait { background: #f59e0b; }
+
+  /* ---------------- 顶部 ---------------- */
+  .top { display: flex; align-items: center; gap: 12px; padding: 14px 18px 10px; }
+  .identity { flex: 1; min-width: 0; }
+  .name-row { display: flex; align-items: baseline; gap: 8px; }
+  .name-row .name { font-size: 17px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .name-row .ver { color: var(--muted); font-size: 12px; }
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px;
+    border: 1px solid var(--border); border-radius: 999px; background: var(--panel);
+    max-width: 52%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
   }
-  .pairing .code { font: 600 26px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: 3px; color: var(--accent); }
-  .nearby-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
-  .nearby-item:first-of-type { border-top: none; padding-top: 0; }
-  .nearby-item .body { flex: 1; min-width: 0; }
-  .item .actions { display: flex; flex-direction: column; gap: 2px; align-items: flex-end; }
-  button.link.retry:hover { color: var(--accent); }
-  .pending { color: var(--accent); font-size: 12px; font-weight: 600; }
-  button.toggle-on { border-color: var(--warn-border); color: var(--warn-text); background: var(--warn-bg); }
-  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 8px; }
-  .seg button { border: none; border-radius: 0; padding: 5px 10px; font-size: 12px; }
+  .status-pill.active { border-color: var(--peer); background: var(--peer-soft); }
+
+  .roles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 18px 10px; }
+  .role {
+    display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; cursor: pointer;
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  .role:hover { border-color: var(--accent); }
+  .role.selected { border-color: var(--accent); background: var(--accent-soft); }
+  .role .radio {
+    width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--offline); flex: none; margin-top: 2px;
+  }
+  .role.selected .radio { border-color: var(--accent); box-shadow: inset 0 0 0 3px var(--panel); background: var(--accent); }
+  .role b { display: block; font-weight: 600; }
+
+  .banner {
+    margin: 0 18px 10px; padding: 9px 12px; border-radius: 8px; font-size: 12.5px;
+    background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-text);
+    display: flex; align-items: center; gap: 10px; white-space: pre-line;
+  }
+  .banner.info { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+  .banner.good { background: var(--peer-soft); border-color: var(--peer); color: var(--text); }
+  .banner .grow { flex: 1; }
+  .banner .code { font: 600 20px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: 2px; color: var(--accent); }
+
+  /* ---------------- 标签页 ---------------- */
+  .tabs { display: flex; gap: 2px; padding: 0 18px; border-bottom: 1px solid var(--border); }
+  .tabs button {
+    border: none; background: none; border-radius: 0; padding: 7px 12px;
+    color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tabs button:hover { color: var(--text); }
+  .tabs button.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  main { flex: 1; overflow-y: auto; padding: 14px 18px 18px; }
+  .tab { display: none; }
+  .tab.active { display: block; }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
+  .card + .card { margin-top: 12px; }
+  .card h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .row .grow { flex: 1; min-width: 0; }
+  .field { margin: 10px 0; }
+  .field:first-child { margin-top: 0; }
+  .field .head { display: flex; justify-content: space-between; margin-bottom: 3px; }
+  .field .head .val { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .field .desc { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  label.check { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; margin: 8px 0; }
+  label.check input { margin-top: 3px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+  .seg button { border: none; border-radius: 0; padding: 4px 12px; }
   .seg button + button { border-left: 1px solid var(--border); }
   .seg button.on { background: var(--accent); color: #fff; }
-  .field { margin: 10px 0; }
-  .field > .head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }
-  .field > .head .val { color: var(--muted); font-variant-numeric: tabular-nums; }
-  .field .desc { color: var(--muted); font-size: 12px; margin-top: 2px; }
-  input[type=range] { width: 100%; accent-color: var(--accent); }
-  select {
-    font: inherit; font-size: 13px; color: var(--text); background: var(--bg);
-    border: 1px solid var(--border); border-radius: 7px; padding: 4px 8px; width: 100%;
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+
+  /* ---------------- 网格布局 ---------------- */
+  .devices { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px; align-items: start; }
+  .grid-card .tools { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+  .grid-card .tools .grow { flex: 1; color: var(--muted); font-size: 12px; }
+  .grid { display: grid; gap: 6px; grid-template-columns: repeat(var(--cols), minmax(0, 1fr)); }
+  .cell {
+    aspect-ratio: 4 / 3; border-radius: 8px; background: var(--cell);
+    display: flex; align-items: center; justify-content: center; position: relative;
+    border: 1.5px dashed transparent;
   }
-  .num {
-    display: inline-flex; align-items: center; justify-content: center; flex: none;
-    min-width: 18px; height: 18px; border-radius: 5px; font-size: 11px; font-weight: 600;
-    background: var(--bg); border: 1px solid var(--border); color: var(--muted); margin-top: 2px;
+  .cell.over { border-color: var(--accent); background: var(--accent-soft); }
+  .tile {
+    width: 100%; height: 100%; padding: 6px 4px 4px; border-radius: 8px; cursor: grab;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+    position: relative; border: 1.5px solid transparent;
   }
-  .item.selectable { cursor: pointer; border-radius: 8px; }
-  .item.selected { background: var(--accent-soft); margin: 0 -8px; padding-left: 8px; padding-right: 8px; }
-  .device.selected .screen { outline: 2px solid var(--accent); outline-offset: 3px; }
-  #deviceEditor h3 { margin: 0 0 6px; font-size: 14px; }
-  .hotkeys { font-size: 12px; color: var(--muted); line-height: 2; }
-  .update-banner {
-    margin: 12px 20px 0; padding: 12px 16px; border-radius: 10px;
-    background: var(--peer-soft); border: 1px solid var(--peer); display: flex; align-items: center; gap: 12px;
+  .tile:active { cursor: grabbing; }
+  .tile.selected { border-color: var(--accent); background: var(--accent-soft); }
+  .tile .screen {
+    width: 54%; aspect-ratio: 16 / 10; border-radius: 4px; position: relative;
+    background: linear-gradient(135deg, #7aa7ff, #5ad1c0 60%, #b9a6ff);
+    box-shadow: inset 0 0 0 2px rgba(0,0,0,.25);
   }
-  .update-banner .body { flex: 1; min-width: 0; }
-  .update-banner details { font-size: 12px; color: var(--muted); margin-top: 4px; white-space: pre-wrap; }
-  .transfer { padding: 8px 0; border-top: 1px solid var(--border); font-size: 13px; }
-  .transfer:first-of-type { border-top: none; padding-top: 0; }
-  .transfer .row { display: flex; justify-content: space-between; gap: 8px; }
-  .transfer .row span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .bar { height: 4px; border-radius: 2px; background: var(--border); margin-top: 6px; overflow: hidden; }
+  .tile .screen::after {
+    content: ""; position: absolute; left: 38%; right: 38%; bottom: -5px; height: 4px;
+    background: var(--offline); border-radius: 0 0 2px 2px;
+  }
+  .tile.offline .screen { filter: grayscale(1); opacity: .45; }
+  .tile.focused .screen { box-shadow: inset 0 0 0 2px rgba(0,0,0,.25), 0 0 0 3px var(--peer); }
+  .tile .label { font-size: 11.5px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; }
+  .tile .meta { font-size: 10.5px; color: var(--muted); display: flex; align-items: center; gap: 4px; max-width: 100%; overflow: hidden; white-space: nowrap; }
+  .tile .num {
+    position: absolute; top: 4px; left: 5px; font-size: 10px; font-weight: 600; color: var(--muted);
+    border: 1px solid var(--border); background: var(--panel); border-radius: 4px; padding: 0 4px;
+  }
+  .tile .badge-host { position: absolute; top: 4px; right: 5px; font-size: 10px; color: var(--accent); font-weight: 600; }
+
+  .list-item { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-top: 1px solid var(--border); }
+  .list-item:first-child { border-top: none; padding-top: 0; }
+  .list-item .grow { flex: 1; min-width: 0; }
+  .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .err { color: var(--danger); font-size: 12px; word-break: break-all; }
+  .pending { color: var(--accent); font-weight: 600; }
+  .kv { display: grid; grid-template-columns: 64px 1fr; gap: 3px 8px; font-size: 12px; margin: 6px 0 4px; }
+  .kv .k { color: var(--muted); }
+
+  .transfer { padding: 7px 0; border-top: 1px solid var(--border); }
+  .transfer:first-child { border-top: none; padding-top: 0; }
+  .bar { height: 4px; border-radius: 2px; background: var(--border); margin-top: 5px; overflow: hidden; }
   .bar > div { height: 100%; background: var(--accent); transition: width .3s; }
-  .transfer.failed .bar > div { background: var(--danger); }
   .transfer.done .bar > div { background: var(--ok); }
-  .ver { font-size: 11px; color: var(--muted); font-weight: 400; margin-left: 4px; }
-  .ver.old { color: var(--warn-text); }
+  .transfer.failed .bar > div { background: var(--danger); }
+
+  .ticket { padding: 8px 10px; border-radius: 8px; background: var(--sunken); border: 1px solid var(--border);
+    font: 11.5px/1.4 ui-monospace, Menlo, Consolas, monospace; word-break: break-all; user-select: text; }
+  .big-status { display: flex; align-items: center; gap: 10px; font-size: 15px; font-weight: 600; }
+
+  .logs {
+    height: calc(100vh - 290px); min-height: 200px; overflow-y: auto; background: var(--sunken);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font: 11.5px/1.55 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-all;
+    user-select: text;
+  }
+  .logs .warn { color: var(--warn-text); }
+  .logs .error { color: var(--danger); }
+
+  #overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.35); display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 15px; z-index: 50;
+  }
   #toast {
-    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px);
-    background: var(--text); color: var(--panel); padding: 8px 14px; border-radius: 8px;
-    font-size: 13px; opacity: 0; transition: all .2s; pointer-events: none; max-width: 80vw;
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%) translateY(16px);
+    background: var(--text); color: var(--panel); padding: 7px 14px; border-radius: 8px;
+    opacity: 0; transition: all .2s; pointer-events: none; max-width: 80vw; z-index: 60;
   }
   #toast.show { opacity: 1; transform: translateX(-50%); }
 </style>
 </head>
 <body>
-<header>
-  <div class="brand">Roam<small id="hostName"></small><small id="hostVer"></small></div>
-  <span class="pill" id="capturePill"><span class="dot"></span><span>键鼠采集</span></span>
-  <div class="spacer"></div>
-  <span class="pill focus" id="focusPill" hidden></span>
-  <button id="homeBtn" hidden>回到本机</button>
-  <button id="lockBtn" title="锁定后光标不会从边缘切走，快捷键仍可用">锁定当前屏幕</button>
-  <button id="pauseBtn" title="暂停后光标不会切到其他设备">暂停切屏</button>
-</header>
-<div class="pairing" id="pairing" hidden></div>
-<div class="update-banner" id="updateBanner" hidden></div>
-<div class="banner" id="banner" hidden></div>
-<main>
-  <div id="stage">
-    <div class="hint">拖动屏幕调整位置，松手后会自动贴靠到相邻屏幕。绿色线段是光标可以穿过的边。</div>
+
+<header class="top">
+  <div class="identity">
+    <div class="name-row">
+      <span class="name" id="myName">Roam</span>
+      <button class="link small" id="renameBtn" title="修改本机名称">修改</button>
+      <span class="ver" id="myVer"></span>
+    </div>
+    <div class="muted small" id="myInfo"></div>
   </div>
-  <aside>
-    <section>
-      <h2>设备 <span class="muted" style="font-weight:400">· 点击设备可单独设置</span></h2>
-      <div id="deviceList"></div>
-    </section>
-    <section id="deviceEditor" hidden></section>
-    <section id="transferSection" hidden>
-      <h2>文件传输 <button class="link" id="openDownloads" style="float:right">打开接收文件夹</button></h2>
-      <div id="transferList"></div>
-    </section>
-    <section id="nearbySection" hidden>
-      <h2>附近的设备</h2>
-      <div id="nearbyList"></div>
-    </section>
-    <section>
-      <h2>通过连接码添加</h2>
-      <p class="muted" style="margin:0 0 8px">同一局域网的设备会自动出现在上面的「附近的设备」里。跨网络时，在被控端托盘菜单里点「复制连接码」，粘贴到这里。</p>
-      <textarea id="ticket" rows="3" placeholder="roam1..."></textarea>
-      <input type="text" id="peerName" placeholder="名称（可选，例如：公司台式机）">
-      <button class="primary" id="addBtn">添加</button>
-    </section>
-    <section id="switchSection">
-      <h2>切屏手感</h2>
-      <div class="field">
-        <div class="head"><span>切屏方式</span></div>
+  <div class="status-pill" id="statusPill"><span class="dot"></span><span></span></div>
+</header>
+
+<div class="roles">
+  <div class="role" data-role="host">
+    <div class="radio"></div>
+    <div><b>用本机的键盘和鼠标控制其他电脑</b><span class="muted small">本机作为主机</span></div>
+  </div>
+  <div class="role" data-role="client">
+    <div class="radio"></div>
+    <div><b>被其他电脑控制</b><span class="muted small">本机作为被控端</span></div>
+  </div>
+</div>
+
+<div id="banners"></div>
+
+<nav class="tabs" id="tabs">
+  <button data-tab="devices" class="active">设备</button>
+  <button data-tab="switching" data-host>切屏</button>
+  <button data-tab="clipboard" data-host>剪贴板</button>
+  <button data-tab="hotkeys" data-host>快捷键</button>
+  <button data-tab="updates">更新</button>
+  <button data-tab="logs">日志</button>
+</nav>
+
+<main>
+  <!-- ============ 设备：主机 ============ -->
+  <section class="tab active" data-panel="devices" id="hostDevices" hidden>
+    <div class="devices">
+      <div>
+        <div class="card grid-card">
+          <div class="tools">
+            <span class="grow">把电脑拖到网格里，左右上下相邻的电脑之间光标可以直接穿过去</span>
+            <button id="lockBtn" class="small" title="锁定后光标不会从边缘切走，快捷键仍可用">锁定当前屏幕</button>
+            <button id="pauseBtn" class="small">暂停</button>
+          </div>
+          <div class="grid" id="grid"></div>
+        </div>
+        <div class="card" id="transferCard" hidden>
+          <div class="row"><h3 class="grow" style="margin:0">文件传输</h3><button class="link small" data-open-downloads>打开接收文件夹</button></div>
+          <div id="transferList" style="margin-top:8px"></div>
+        </div>
+      </div>
+      <div>
+        <div class="card" id="detail"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 设备：被控端 ============ -->
+  <section class="tab active" data-panel="devices" id="clientDevices" hidden>
+    <div class="two">
+      <div>
+        <div class="card">
+          <h3>连接状态</h3>
+          <div class="big-status" id="clientStatus"><span class="dot"></span><span></span></div>
+          <div class="kv" id="clientHostInfo"></div>
+        </div>
+        <div class="card">
+          <h3>连接码</h3>
+          <p class="muted small" style="margin:0 0 8px">同一局域网里的主机会自动发现本机，在主机的「设备」里点添加即可。跨网络时，把下面的连接码发给主机。</p>
+          <div class="ticket" id="ticket"></div>
+          <div class="row" style="margin-top:8px"><span class="grow"></span><button id="copyTicket">复制连接码</button></div>
+        </div>
+      </div>
+      <div>
+        <div class="card">
+          <h3>已授权的主机</h3>
+          <div id="trustedList"></div>
+        </div>
+        <div class="card" id="clientTransferCard" hidden>
+          <div class="row"><h3 class="grow" style="margin:0">文件传输</h3><button class="link small" data-open-downloads>打开接收文件夹</button></div>
+          <div id="clientTransferList" style="margin-top:8px"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 切屏 ============ -->
+  <section class="tab" data-panel="switching">
+    <div class="two">
+      <div class="card">
+        <h3>切屏方式</h3>
         <div class="seg" id="modeSeg">
           <button data-mode="instant">直接切</button>
           <button data-mode="dwell">停留后切</button>
           <button data-mode="double">撞两下</button>
         </div>
-        <div class="field" id="dwellField">
+        <div class="field" id="dwellField" style="margin-top:12px">
           <div class="head"><span>停留时间</span><span class="val" id="dwellVal"></span></div>
           <input type="range" id="dwell" min="50" max="1000" step="10">
           <div class="desc">光标顶住边缘这么久才切过去，防止误切。</div>
         </div>
-        <div class="field" id="tapField">
+        <div class="field" id="tapField" style="margin-top:12px">
           <div class="head"><span>两次撞边的最大间隔</span><span class="val" id="tapVal"></span></div>
           <input type="range" id="tapWindow" min="200" max="1000" step="10">
-          <div class="desc">在这个时间内撞两次边缘才切过去。</div>
+        </div>
+        <div class="field" style="margin-top:14px">
+          <div class="head"><span>需要按住</span></div>
+          <select id="requireMod">
+            <option value="">不需要</option>
+            <option value="shift">Shift</option>
+            <option value="ctrl">Ctrl</option>
+            <option value="alt">Option / Alt</option>
+            <option value="cmd">Cmd / Win</option>
+          </select>
+          <div class="desc">只有按住这个键时，光标才会从边缘切走。</div>
         </div>
       </div>
-      <div class="field">
-        <div class="head"><span>需要按住</span></div>
-        <select id="requireMod">
-          <option value="">不需要</option>
-          <option value="shift">Shift</option>
-          <option value="ctrl">Ctrl</option>
-          <option value="alt">Option</option>
-          <option value="cmd">Cmd</option>
-        </select>
-        <div class="desc">只有按住这个键时，光标才会从边缘切走。</div>
-      </div>
-      <div class="field">
-        <div class="head"><span>角落死区</span><span class="val" id="cornerVal"></span></div>
-        <input type="range" id="corner" min="0" max="200" step="5">
-        <div class="desc">屏幕四角附近不切屏，避免和触发角冲突。</div>
-      </div>
-      <div class="field">
-        <div class="head"><span>跨屏位置</span></div>
-        <div class="seg" id="mappingSeg">
-          <button data-mapping="aligned">按布局对齐</button>
-          <button data-mapping="proportional">按比例</button>
+      <div class="card">
+        <h3>细节</h3>
+        <div class="field">
+          <div class="head"><span>角落死区</span><span class="val" id="cornerVal"></span></div>
+          <input type="range" id="corner" min="0" max="200" step="5">
+          <div class="desc">屏幕四角附近不切屏，避免和系统的触发角冲突。</div>
         </div>
-        <div class="desc">按比例：从屏幕边 30% 的位置离开，就从对方屏幕边 30% 的位置进入，两块屏幕大小差别大时更顺手。</div>
+        <label class="check"><input type="checkbox" id="swapCmd"><span>Mac 和 Windows 互控时 Cmd ↔ Ctrl 对调<br><span class="muted small">Mac 控制 Windows 时 Cmd+C 就是 Ctrl+C，反过来也一样</span></span></label>
+        <p class="muted small" style="margin:10px 0 0">跨屏时位置沿边按比例对应：从屏幕边 30% 的位置离开，就从对方屏幕边 30% 的位置进入。每台设备的指针速度、滚轮方向在「设备」里点击它单独设置。</p>
       </div>
+    </div>
+  </section>
+
+  <!-- ============ 剪贴板 ============ -->
+  <section class="tab" data-panel="clipboard">
+    <div class="two">
+      <div class="card">
+        <h3>剪贴板同步</h3>
+        <label class="check"><input type="checkbox" id="clipEnabled"><span>切屏时同步剪贴板<br><span class="muted small">在一台电脑上复制，切到另一台直接粘贴，双向都可以</span></span></label>
+        <label class="check"><input type="checkbox" id="clipImages"><span>同步图片<br><span class="muted small">只在复制的内容里没有文字时才同步图片</span></span></label>
+        <div class="field">
+          <div class="head"><span>文本 / 图片大小上限</span></div>
+          <select id="clipMax">
+            <option value="5">5 MB</option><option value="20">20 MB</option>
+            <option value="50">50 MB</option><option value="100">100 MB</option>
+          </select>
+        </div>
+      </div>
+      <div class="card">
+        <h3>文件传输</h3>
+        <label class="check"><input type="checkbox" id="clipFiles"><span>复制文件后切屏时传输文件<br><span class="muted small">收到的文件放在「下载/Roam」，传完后直接粘贴即可</span></span></label>
+        <div class="field">
+          <div class="head"><span>单次传输上限</span></div>
+          <select id="clipFileMax">
+            <option value="1024">1 GB</option><option value="4096">4 GB</option>
+            <option value="10240">10 GB</option><option value="51200">50 GB</option>
+          </select>
+        </div>
+        <button data-open-downloads>打开接收文件夹</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 快捷键 ============ -->
+  <section class="tab" data-panel="hotkeys">
+    <div class="card">
+      <h3>快捷键</h3>
       <div class="field">
-        <label class="toggle">
-          <input type="checkbox" id="swapCmd">
-          <span>控制 Windows 时 Cmd ↔ Ctrl 对调<br><span class="muted">开启后 Cmd+C / Cmd+V 在 Windows 上就是 Ctrl+C / Ctrl+V</span></span>
-        </label>
-      </div>
-    </section>
-    <section>
-      <h2>剪贴板同步</h2>
-      <label class="toggle field" style="margin-top:0"><input type="checkbox" id="clipEnabled"><span>切屏时同步剪贴板<br><span class="muted">在一台电脑上复制，切到另一台直接粘贴，双向都可以</span></span></label>
-      <label class="toggle field"><input type="checkbox" id="clipImages"><span>同步图片<br><span class="muted">只在复制的内容里没有文字时才同步图片</span></span></label>
-      <label class="toggle field"><input type="checkbox" id="clipFiles"><span>复制文件后切屏时传输文件<br><span class="muted">收到的文件放在「下载/Roam」，传完后直接粘贴即可</span></span></label>
-      <div class="field">
-        <div class="head"><span>文件传输上限</span></div>
-        <select id="clipFileMax">
-          <option value="1024">1 GB</option>
-          <option value="4096">4 GB</option>
-          <option value="10240">10 GB</option>
-          <option value="51200">50 GB</option>
-        </select>
-      </div>
-      <div class="field">
-        <div class="head"><span>文本 / 图片大小上限</span></div>
-        <select id="clipMax">
-          <option value="5">5 MB</option>
-          <option value="20">20 MB</option>
-          <option value="50">50 MB</option>
-          <option value="100">100 MB</option>
-        </select>
-        <div class="desc">超过上限的内容不同步，避免慢速网络下卡顿。</div>
-      </div>
-    </section>
-    <section>
-      <h2>更新</h2>
-      <div class="field" style="margin-top:0">
-        <div class="head"><span id="updInfo"></span></div>
-        <button id="checkUpdate">检查更新</button>
-      </div>
-      <div class="field">
-        <div class="head"><span>下载镜像（可选）</span></div>
-        <input type="text" id="mirror" placeholder="例如 https://ghfast.top/">
-        <div class="desc">从 GitHub 下载很慢时，填一个加速镜像前缀。留空表示直连（会使用系统代理）。</div>
-      </div>
-    </section>
-    <section>
-      <h2>快捷键</h2>
-      <div class="field" style="margin-top:0">
         <div class="head"><span>修饰键组合</span></div>
-        <select id="hotkeyMods">
+        <select id="hotkeyMods" style="max-width:280px">
           <option value="ctrl,alt,cmd">Ctrl + Option + Cmd</option>
           <option value="ctrl,alt">Ctrl + Option</option>
           <option value="ctrl,cmd">Ctrl + Cmd</option>
           <option value="alt,cmd">Option + Cmd</option>
           <option value="ctrl,shift">Ctrl + Shift</option>
         </select>
+        <div class="desc">Windows 上 Option 对应 Alt，Cmd 对应 Win 键。</div>
       </div>
-      <div class="hotkeys" id="hotkeyHelp"></div>
-    </section>
-  </aside>
+      <div id="hotkeyHelp" style="line-height:2.1"></div>
+    </div>
+  </section>
+
+  <!-- ============ 更新 ============ -->
+  <section class="tab" data-panel="updates">
+    <div class="card" id="hostUpdate">
+      <h3>应用内更新</h3>
+      <div class="row"><span class="grow" id="updInfo"></span><button id="checkUpdate">检查更新</button></div>
+      <div id="updResult" class="small" style="margin-top:8px"></div>
+      <div class="field" style="margin-top:14px">
+        <div class="head"><span>下载镜像（可选）</span></div>
+        <input type="text" id="mirror" placeholder="例如 https://ghfast.top/" style="max-width:420px">
+        <div class="desc">从 GitHub 下载很慢时填一个加速镜像前缀；安装包仍会用 GitHub 上的校验和验证，不怕镜像篡改。</div>
+      </div>
+    </div>
+    <div class="card" id="clientUpdate">
+      <h3>更新</h3>
+      <p class="muted" style="margin:0">被控端由主机统一更新：主机发现新版本后，点「更新所有设备」会把新版本推送到这里并自动重启。</p>
+    </div>
+  </section>
+
+  <!-- ============ 日志 ============ -->
+  <section class="tab" data-panel="logs">
+    <div class="row" style="margin-bottom:8px">
+      <span class="grow muted small">最近的运行日志（同时保存在日志文件里，出问题时可以发给开发者）</span>
+      <button id="openLogs" class="small">打开日志文件夹</button>
+      <button id="copyLogs" class="small">复制</button>
+    </div>
+    <div class="logs" id="logs"></div>
+  </section>
 </main>
+
+<div id="overlay" hidden></div>
 <div id="toast"></div>
 
 <script>
-const OS_LABEL = { MacOs: 'macOS', Windows: 'Windows', Linux: 'Linux', Other: '其他' };
-const PAD = 48;          // 画布内边距（像素）
-const MAX_SCALE = 0.3;   // 最大缩放，避免设备少时画得过大
-const ALIGN_PX = 14;     // 对齐吸附阈值（像素）
-
-const stage = document.getElementById('stage');
+const OS = { MacOs: 'macOS', Windows: 'Windows', Linux: 'Linux', Other: '其他' };
+const MOD = { ctrl: 'Ctrl', alt: 'Option', cmd: 'Cmd', shift: 'Shift' };
 let state = null;
-let positions = {};      // 设备 id → 全局位置（工作副本，拖拽时实时修改）
-let view = { scale: 0.1, ox: 0, oy: 0 };
-let drag = null;
-let layoutSig = '';
-const nodes = new Map();
+let tab = 'devices';
+let selectedId = null;
+let detailFor = null;
+let dragId = null;
 
-// ------------------------------------------------------------ 数据
-
-async function refresh() {
-  try {
-    const res = await fetch('/api/state');
-    state = await res.json();
-  } catch {
-    showBanner('与 roam host 的连接已断开，请确认它仍在运行。');
-    return;
-  }
-  if (!drag) {
-    positions = {};
-    for (const d of state.devices) if (d.pos) positions[d.id] = { ...d.pos };
-  }
-  const sig = placed().map(d => d.id + ':' + d.displays.length).join('|');
-  if (sig !== layoutSig && !drag) { layoutSig = sig; fitView(); }
-  render();
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+/// 内容没变就不动 DOM：每秒刷新时重建元素会打断点击和拖拽
+function setHtml(el, html) { if (el._html !== html) { el.innerHTML = html; el._html = html; } }
+const busy = el => document.activeElement === el || el.matches(':active');
+function setValue(el, v) { if (busy(el)) return; if (el.type === 'checkbox') el.checked = v; else el.value = v; }
+function fmtBytes(n) {
+  const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return i ? `${n.toFixed(1)} ${u[i]}` : `${n} B`;
 }
-
-function placed() {
-  return state ? state.devices.filter(d => d.displays.length && positions[d.id]) : [];
-}
-
-function bboxLocal(displays) {
-  const xs = displays.map(d => d.rect.x), ys = displays.map(d => d.rect.y);
-  const x1 = Math.max(...displays.map(d => d.rect.x + d.rect.w));
-  const y1 = Math.max(...displays.map(d => d.rect.y + d.rect.h));
-  const x = Math.min(...xs), y = Math.min(...ys);
-  return { x, y, w: x1 - x, h: y1 - y };
-}
-
-function worldRect(dev, pos = positions[dev.id]) {
-  const b = bboxLocal(dev.displays);
-  return { x: pos.x, y: pos.y, w: b.w, h: b.h };
-}
-
-function globalDisplays(dev, pos = positions[dev.id]) {
-  const b = bboxLocal(dev.displays);
-  return dev.displays.map(d => ({ x: d.rect.x - b.x + pos.x, y: d.rect.y - b.y + pos.y, w: d.rect.w, h: d.rect.h }));
-}
-
-// ------------------------------------------------------------ 视图
-
-function fitView() {
-  const devs = placed();
-  if (!devs.length) return;
-  const rects = devs.map(d => worldRect(d));
-  const x0 = Math.min(...rects.map(r => r.x)), y0 = Math.min(...rects.map(r => r.y));
-  const x1 = Math.max(...rects.map(r => r.x + r.w)), y1 = Math.max(...rects.map(r => r.y + r.h));
-  const W = stage.clientWidth - PAD * 2, H = stage.clientHeight - PAD * 2;
-  if (W <= 0 || H <= 0) return; // 页面不可见时尺寸为 0
-  const scale = Math.min(W / (x1 - x0), H / (y1 - y0), MAX_SCALE);
-  view = {
-    scale,
-    ox: PAD + (W - (x1 - x0) * scale) / 2 - x0 * scale,
-    oy: PAD + (H - (y1 - y0) * scale) / 2 - y0 * scale,
-  };
-}
-
-const toPx = (x, y) => [view.ox + x * view.scale, view.oy + y * view.scale];
-
-function render() {
-  if (!state) return;
-  const host = state.devices.find(d => d.is_host);
-  document.getElementById('hostName').textContent = host ? '· ' + host.name : '';
-
-  const cap = document.getElementById('capturePill');
-  cap.querySelector('.dot').classList.toggle('on', state.capture_ok);
-  cap.lastElementChild.textContent = state.capture_ok ? '键鼠采集已就绪' : '键鼠采集未就绪';
-  if (!state.capture_ok && state.capture_message) showBanner(state.capture_message); else hideBanner();
-
-  const focused = state.devices.find(d => d.id === state.focused);
-  const fp = document.getElementById('focusPill');
-  fp.hidden = !focused;
-  document.getElementById('homeBtn').hidden = !focused;
-  if (focused) fp.innerHTML = `<span class="dot on"></span>正在控制：${esc(focused.name)}`;
-
-  const lockBtn = document.getElementById('lockBtn');
-  lockBtn.textContent = state.edge_locked ? '已锁定 · 点击解锁' : '锁定当前屏幕';
-  lockBtn.classList.toggle('toggle-on', state.edge_locked);
-
-  const pauseBtn = document.getElementById('pauseBtn');
-  pauseBtn.textContent = state.paused ? '已暂停 · 点击恢复' : '暂停切屏';
-  pauseBtn.classList.toggle('toggle-on', state.paused);
-
-  const pending = state.devices.filter(d => d.pending_code);
-  const pairing = document.getElementById('pairing');
-  pairing.hidden = !pending.length;
-  if (pending.length) {
-    setHtml(pairing, pending.map(d =>
-      `<div style="flex:1">请在「${esc(d.name)}」弹出的窗口里确认连接请求，并核对两边的校验码一致</div><div class="code">${esc(d.pending_code)}</div>`
-    ).join(''));
-  }
-
-  renderNearby();
-  renderSwitching();
-  renderClipboard();
-  renderUpdate();
-  renderTransfers();
-  renderEditor();
-
-  const swap = document.getElementById('swapCmd');
-  if (document.activeElement !== swap) swap.checked = state.swap_cmd_ctrl;
-
-  renderStage();
-  renderList();
-  // 首次渲染后再开启过渡动画，避免设备从左上角滑入
-  if (!stage.classList.contains('ready')) requestAnimationFrame(() => stage.classList.add('ready'));
-}
-
-function renderStage() {
-  const devs = placed();
-  const seen = new Set();
-  stage.querySelector('.empty')?.remove();
-  if (!devs.length) {
-    stage.insertAdjacentHTML('beforeend', '<div class="empty">还没有可以摆放的屏幕。<br>添加被控设备并等它上线一次后，它的屏幕就会出现在这里。</div>');
-  }
-
-  for (const dev of devs) {
-    seen.add(dev.id);
-    let el = nodes.get(dev.id);
-    if (!el) {
-      el = document.createElement('div');
-      el.className = 'device';
-      el.addEventListener('pointerdown', e => startDrag(e, dev.id));
-      stage.appendChild(el);
-      nodes.set(dev.id, el);
-    }
-    const r = worldRect(dev);
-    const [left, top] = toPx(r.x, r.y);
-    Object.assign(el.style, {
-      left: left + 'px', top: top + 'px',
-      width: r.w * view.scale + 'px', height: r.h * view.scale + 'px',
-    });
-    el.classList.toggle('host', dev.is_host);
-    el.classList.toggle('offline', !dev.online);
-    el.classList.toggle('focused', dev.id === state.focused);
-    el.classList.toggle('dragging', drag?.id === dev.id);
-    el.classList.toggle('selected', selectedId === dev.id);
-
-    const b = bboxLocal(dev.displays);
-    const status = dev.is_host ? '本机 · 主机' : dev.online ? (dev.path || '在线') + rtt(dev) : '离线';
-    const res = dev.displays.map(d => `${Math.round(d.rect.w * d.scale)}×${Math.round(d.rect.h * d.scale)}`).join(' + ');
-    el.innerHTML = dev.displays.map(d => {
-      const s = view.scale;
-      return `<div class="screen" style="left:${(d.rect.x - b.x) * s}px;top:${(d.rect.y - b.y) * s}px;width:${d.rect.w * s - 3}px;height:${d.rect.h * s - 3}px"></div>`;
-    }).join('') + `<div class="label"><div class="name">${esc(dev.name)}</div><div class="meta">${esc(OS_LABEL[dev.os] || '')} · ${res}</div><div class="meta">${esc(status)}</div></div>`;
-  }
-  for (const [id, el] of nodes) if (!seen.has(id)) { el.remove(); nodes.delete(id); }
-
-  // 贴靠预览与可穿越的边
-  stage.querySelectorAll('.ghost, .edge').forEach(n => n.remove());
-  if (drag?.snap) {
-    const dev = devs.find(d => d.id === drag.id);
-    const r = worldRect(dev, drag.snap);
-    const [l, t] = toPx(r.x, r.y);
-    stage.insertAdjacentHTML('beforeend',
-      `<div class="ghost" style="left:${l}px;top:${t}px;width:${r.w * view.scale}px;height:${r.h * view.scale}px"></div>`);
-  }
-  if (!drag) for (const e of sharedEdges(devs)) {
-    const [l, t] = toPx(e.x, e.y);
-    const T = 6, inset = 6; // 线宽；两端各缩进一点，避免和圆角重叠
-    const style = e.w
-      ? `left:${l + inset}px;top:${t - T / 2}px;width:${e.w * view.scale - inset * 2}px;height:${T}px`
-      : `left:${l - T / 2}px;top:${t + inset}px;width:${T}px;height:${e.h * view.scale - inset * 2}px`;
-    stage.insertAdjacentHTML('beforeend', `<div class="edge" style="${style}"></div>`);
-  }
-}
-
-function renderList() {
-  const list = document.getElementById('deviceList');
-  setHtml(list, state.devices.map(dev => {
-    const status = dev.is_host ? '本机'
-      : dev.online ? `在线 · ${dev.path || ''}${rtt(dev)}`
-      : dev.pending_code ? ''
-      : dev.denied ? '已被拒绝'
-      : dev.error ? '离线 · 正在重连…'
-      : (dev.displays.length ? '离线' : '正在连接…');
-    const pendingLine = dev.pending_code ? `<div class="pending">等待对方确认 · 校验码 ${esc(dev.pending_code)}</div>` : '';
-    const err = !dev.is_host && !dev.online && dev.error ? `<div class="err">${esc(dev.error)}</div>` : '';
-    const retry = !dev.is_host && !dev.online && (dev.denied || dev.error) ? `<button class="link retry" data-retry="${dev.id}">重试</button>` : '';
-    const n = deviceNumber(dev);
-    const verOld = !dev.is_host && dev.online && dev.version && dev.version !== state.version;
-    const ver = dev.version ? `<span class="ver ${verOld ? 'old' : ''}">v${esc(dev.version)}</span>` : '';
-    const syncBtn = verOld ? `<button class="link retry" data-syncver="${dev.id}">同步版本</button>` : '';
-    const disabled = dev.settings && !dev.settings.enabled;
-    return `<div class="item ${dev.is_host ? '' : 'selectable'} ${selectedId === dev.id ? 'selected' : ''}" data-select="${dev.is_host ? '' : dev.id}">
-      <span class="num" title="快捷键编号">${n ?? '–'}</span>
-      <span class="dot ${dev.online ? 'on' : ''}" style="margin-top:7px"></span>
-      <div class="body">
-        <div class="title"><span>${esc(dev.name)}</span>
-          <span class="badge ${dev.is_host ? '' : 'peer'}">${dev.is_host ? '主机' : esc(OS_LABEL[dev.os] || '被控')}</span>${ver}${disabled ? '<span class="badge" style="background:var(--bg);color:var(--muted)">已停用</span>' : ''}</div>
-        ${status ? `<div class="sub">${esc(status)}</div>` : ''}${pendingLine}${err}
-      </div>
-      ${dev.is_host ? '' : `<div class="actions">${retry}${syncBtn}<button class="link" data-remove="${dev.id}">移除</button></div>`}
-    </div>`;
-  }).join(''));
-}
-
-const rtt = dev => dev.rtt_ms != null ? ` · ${dev.rtt_ms < 10 ? dev.rtt_ms.toFixed(1) : Math.round(dev.rtt_ms)} ms` : '';
-
-// 不同设备之间相互接触的显示器边，即光标可以穿过的地方
-function sharedEdges(devs) {
-  const edges = [];
-  const EPS = 1;
-  for (let i = 0; i < devs.length; i++) for (let j = i + 1; j < devs.length; j++) {
-    for (const a of globalDisplays(devs[i])) for (const b of globalDisplays(devs[j])) {
-      for (const [p, q] of [[a, b], [b, a]]) {
-        if (Math.abs(p.x + p.w - q.x) < EPS) {
-          const y0 = Math.max(p.y, q.y), y1 = Math.min(p.y + p.h, q.y + q.h);
-          if (y1 - y0 > EPS) edges.push({ x: q.x, y: y0, w: 0, h: y1 - y0 });
-        }
-        if (Math.abs(p.y + p.h - q.y) < EPS) {
-          const x0 = Math.max(p.x, q.x), x1 = Math.min(p.x + p.w, q.x + q.w);
-          if (x1 - x0 > EPS) edges.push({ x: x0, y: q.y, w: x1 - x0, h: 0 });
-        }
-      }
-    }
-  }
-  return edges;
-}
-
-// ------------------------------------------------------------ 拖拽与吸附
-
-function startDrag(e, id) {
-  e.preventDefault();
-  e.currentTarget.setPointerCapture(e.pointerId);
-  drag = { id, sx: e.clientX, sy: e.clientY, orig: { ...positions[id] }, snap: null, moved: false };
-  render();
-}
-
-window.addEventListener('pointermove', e => {
-  if (!drag) return;
-  if (!drag.moved && Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) < 4) return;
-  drag.moved = true;
-  const p = {
-    x: drag.orig.x + (e.clientX - drag.sx) / view.scale,
-    y: drag.orig.y + (e.clientY - drag.sy) / view.scale,
-  };
-  positions[drag.id] = p;
-  drag.snap = snapPosition(drag.id, p);
-  renderStage();
-});
-
-window.addEventListener('pointerup', async () => {
-  if (!drag) return;
-  const { id, snap, orig, moved } = drag;
-  positions[id] = moved ? (snap || orig) : orig;
-  drag = null;
-  if (!moved) {
-    const dev = state.devices.find(d => d.id === id);
-    if (dev && !dev.is_host) selectDevice(id);
-    render();
-    return;
-  }
-  fitView();
-  render();
-  try {
-    await api('PUT', '/api/layout', { positions });
-  } catch (err) {
-    toast('保存失败：' + err.message);
-  }
-});
-
-const overlaps = (a, b) => a.x < b.x + b.w - 0.5 && b.x < a.x + a.w - 0.5 && a.y < b.y + b.h - 0.5 && b.y < a.y + a.h - 0.5;
-const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
-
-/// 把被拖动的设备贴到最近的另一台设备的某条边上，并在接近时对齐顶部 / 底部 / 中线。
-function snapPosition(id, p) {
-  const devs = placed();
-  const me = devs.find(d => d.id === id);
-  const others = devs.filter(d => d.id !== id).map(d => worldRect(d));
-  if (!others.length) return p;
-  const m = worldRect(me, p);
-  const align = ALIGN_PX / view.scale;
-  const pick = (v, targets) => targets.reduce((best, t) => Math.abs(v - t) < Math.abs(v - best) && Math.abs(v - t) < align ? t : best, v);
-
-  const cands = [];
-  for (const o of others) {
-    const minOv = Math.min(120, m.h * 0.3, o.h * 0.3);
-    const minOvX = Math.min(120, m.w * 0.3, o.w * 0.3);
-    const y = pick(clamp(p.y, o.y - m.h + minOv, o.y + o.h - minOv), [o.y, o.y + o.h - m.h, o.y + (o.h - m.h) / 2]);
-    const x = pick(clamp(p.x, o.x - m.w + minOvX, o.x + o.w - minOvX), [o.x, o.x + o.w - m.w, o.x + (o.w - m.w) / 2]);
-    cands.push({ x: o.x + o.w, y }, { x: o.x - m.w, y }, { x, y: o.y + o.h }, { x, y: o.y - m.h });
-  }
-  let best = null, bestDist = Infinity;
-  for (const c of cands) {
-    const r = { ...m, x: c.x, y: c.y };
-    if (others.some(o => overlaps(r, o))) continue;
-    const dist = Math.hypot(c.x - p.x, c.y - p.y);
-    if (dist < bestDist) { best = c; bestDist = dist; }
-  }
-  return best;
-}
-
-// ------------------------------------------------------------ 操作
+const rttText = ms => ms == null ? '' : `${ms < 10 ? ms.toFixed(1) : Math.round(ms)} ms`;
+const screens = d => d.displays.map(x => `${Math.round(x.rect.w * x.scale)}×${Math.round(x.rect.h * x.scale)}`).join(' + ');
 
 async function api(method, url, body) {
   const res = await fetch(url, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
+    headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) throw new Error(await res.text() || res.statusText);
-  return res.status === 204 ? null : res.json();
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+let toastTimer;
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
 }
 
-document.getElementById('addBtn').addEventListener('click', async () => {
-  const ticket = document.getElementById('ticket').value.trim();
-  const name = document.getElementById('peerName').value.trim();
-  if (!ticket) return toast('请先粘贴连接码');
-  try {
-    await api('POST', '/api/peers', { ticket, name: name || null });
-    document.getElementById('ticket').value = '';
-    document.getElementById('peerName').value = '';
-    toast('已添加，正在连接…（首次连接需要在被控端弹出的窗口里确认）');
-    refresh();
-  } catch (err) {
-    toast(err.message);
-  }
-});
+// ------------------------------------------------------------ 刷新
 
-document.getElementById('deviceList').addEventListener('click', async e => {
-  const syncId = e.target.dataset?.syncver;
-  if (syncId) {
-    try { await api('POST', `/api/peers/${encodeURIComponent(syncId)}/sync-version`); toast('正在把这台设备同步到主机的版本…'); }
-    catch (err) { toast(err.message); }
+async function refresh() {
+  try {
+    state = await (await fetch('/api/state')).json();
+  } catch {
+    setHtml($('banners'), '<div class="banner">与 Roam 后台的连接断开了，正在重连…</div>');
     return;
   }
-  const retryId = e.target.dataset?.retry;
-  if (retryId) {
-    try { await api('POST', `/api/peers/${encodeURIComponent(retryId)}/retry`); toast('正在重新连接…'); refresh(); }
-    catch (err) { toast(err.message); }
-    return;
-  }
-  const id = e.target.dataset?.remove;
-  if (!id) {
-    const item = e.target.closest('[data-select]');
-    if (item?.dataset.select) selectDevice(item.dataset.select);
-    return;
-  }
-  const dev = state.devices.find(d => d.id === id);
-  if (!confirm(`移除「${dev?.name}」？之后需要重新粘贴连接码才能再次控制它。`)) return;
-  try { await api('DELETE', '/api/peers/' + encodeURIComponent(id)); refresh(); }
-  catch (err) { toast(err.message); }
-});
-
-document.getElementById('swapCmd').addEventListener('change', async e => {
-  try { await api('PUT', '/api/settings', { swap_cmd_ctrl: e.target.checked }); }
-  catch (err) { toast(err.message); }
-});
-
-document.getElementById('homeBtn').addEventListener('click', () => api('POST', '/api/home').then(refresh));
-
-function renderNearby() {
-  const section = document.getElementById('nearbySection');
-  section.hidden = !state.nearby.length;
-  setHtml(document.getElementById('nearbyList'), state.nearby.map(d => `
-    <div class="nearby-item">
-      <span class="dot on"></span>
-      <div class="body">
-        <div class="title"><b>${esc(d.name)}</b> <span class="badge peer">${esc(OS_LABEL[d.os] || '未知')}</span></div>
-        <div class="sub muted">${esc(d.id.slice(0, 10))}</div>
-      </div>
-      <button class="primary" data-add="${d.id}">添加</button>
-    </div>`).join(''));
-}
-
-document.getElementById('nearbyList').addEventListener('click', async e => {
-  const id = e.target.dataset?.add;
-  if (!id) return;
-  const d = state.nearby.find(n => n.id === id);
-  if (!d) return;
-  e.target.disabled = true;
-  try {
-    await api('POST', '/api/peers', { ticket: d.ticket, name: d.name });
-    toast(`已添加「${d.name}」，请在对方屏幕上确认连接请求`);
-    refresh();
-  } catch (err) {
-    toast(err.message);
-    e.target.disabled = false;
-  }
-});
-
-document.getElementById('pauseBtn').addEventListener('click', async () => {
-  try { await api('PUT', '/api/pause', { paused: !state.paused }); refresh(); }
-  catch (err) { toast(err.message); }
-});
-
-// ------------------------------------------------------------ 切屏手感
-
-const MOD_LABEL = { ctrl: 'Ctrl', alt: 'Option', cmd: 'Cmd', shift: 'Shift' };
-let selectedId = null;
-
-function deviceNumber(dev) {
-  if (dev.is_host) return 1;
-  if (dev.settings && !dev.settings.enabled) return null;
-  const peers = state.devices.filter(d => !d.is_host && (!d.settings || d.settings.enabled));
-  const i = peers.findIndex(d => d.id === dev.id);
-  return i >= 0 && i < 8 ? i + 2 : null;
-}
-
-/// 用户正在操作的控件不要被定时刷新覆盖
-const busy = el => document.activeElement === el || el.matches(':active');
-
-function setValue(el, value) {
-  if (busy(el)) return;
-  if (el.type === 'checkbox') el.checked = value; else el.value = value;
-}
-
-function renderSwitching() {
-  const sw = state.switching;
-  const mode = sw.double_tap ? 'double' : sw.dwell_ms > 0 ? 'dwell' : 'instant';
-  document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
-  document.getElementById('dwellField').hidden = mode !== 'dwell';
-  document.getElementById('tapField').hidden = mode !== 'double';
-  setValue(document.getElementById('dwell'), sw.dwell_ms || 250);
-  document.getElementById('dwellVal').textContent = `${sw.dwell_ms || 250} ms`;
-  setValue(document.getElementById('tapWindow'), sw.double_tap_window_ms);
-  document.getElementById('tapVal').textContent = `${sw.double_tap_window_ms} ms`;
-  setValue(document.getElementById('requireMod'), sw.require_modifier || '');
-  setValue(document.getElementById('corner'), sw.corner_deadzone);
-  document.getElementById('cornerVal').textContent = sw.corner_deadzone ? `${Math.round(sw.corner_deadzone)} pt` : '关闭';
-  document.querySelectorAll('#mappingSeg button').forEach(b => b.classList.toggle('on', b.dataset.mapping === sw.edge_mapping));
-  setValue(document.getElementById('hotkeyMods'), sw.hotkey_modifiers.join(','));
-
-  const combo = sw.hotkey_modifiers.map(m => `<kbd>${MOD_LABEL[m]}</kbd>`).join(' + ');
-  const numbered = state.devices
-    .map(d => [deviceNumber(d), d.name])
-    .filter(([n]) => n)
-    .map(([n, name]) => `${combo} + <kbd>${n}</kbd>：切到「${esc(name)}」`)
-    .join('<br>');
-  setHtml(document.getElementById('hotkeyHelp'),
-    `${combo} + <kbd>Esc</kbd>：回到本机<br>${numbered}<br>${combo} + <kbd>L</kbd>：锁定 / 解锁当前屏幕`);
-}
-
-let saveTimer;
-/// 改设置时先更新本地状态让界面立即响应，再合并短时间内的多次修改一起保存
-function saveSwitching(patch) {
-  Object.assign(state.switching, patch);
-  renderSwitching();
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    api('PUT', '/api/settings', { switching: state.switching }).catch(err => toast('保存失败：' + err.message));
-  }, 250);
-}
-
-document.getElementById('modeSeg').addEventListener('click', e => {
-  const mode = e.target.dataset?.mode;
-  if (!mode) return;
-  const dwell = Number(document.getElementById('dwell').value) || 250;
-  saveSwitching({
-    double_tap: mode === 'double',
-    dwell_ms: mode === 'dwell' ? dwell : 0,
-  });
-});
-document.getElementById('dwell').addEventListener('input', e => saveSwitching({ dwell_ms: Number(e.target.value) }));
-document.getElementById('tapWindow').addEventListener('input', e => saveSwitching({ double_tap_window_ms: Number(e.target.value) }));
-document.getElementById('requireMod').addEventListener('change', e => saveSwitching({ require_modifier: e.target.value || null }));
-document.getElementById('corner').addEventListener('input', e => saveSwitching({ corner_deadzone: Number(e.target.value) }));
-document.getElementById('mappingSeg').addEventListener('click', e => {
-  const mapping = e.target.dataset?.mapping;
-  if (mapping) saveSwitching({ edge_mapping: mapping });
-});
-document.getElementById('hotkeyMods').addEventListener('change', e => saveSwitching({ hotkey_modifiers: e.target.value.split(',') }));
-
-document.getElementById('lockBtn').addEventListener('click', async () => {
-  try { await api('PUT', '/api/lock', { locked: !state.edge_locked }); refresh(); }
-  catch (err) { toast(err.message); }
-});
-
-// ------------------------------------------------------------ 剪贴板
-
-function renderClipboard() {
-  const c = state.clipboard;
-  setValue(document.getElementById('clipEnabled'), c.enabled);
-  setValue(document.getElementById('clipImages'), c.images);
-  setValue(document.getElementById('clipMax'), String(c.max_mb));
-  setValue(document.getElementById('clipFiles'), c.files);
-  setValue(document.getElementById('clipFileMax'), String(c.max_file_mb));
-  document.getElementById('clipFiles').disabled = !c.enabled;
-  document.getElementById('clipFileMax').disabled = !c.enabled || !c.files;
-  document.getElementById('clipImages').disabled = !c.enabled;
-  document.getElementById('clipMax').disabled = !c.enabled;
-}
-
-function saveClipboard(patch) {
-  Object.assign(state.clipboard, patch);
-  renderClipboard();
-  api('PUT', '/api/settings', { clipboard: state.clipboard }).catch(err => toast('保存失败：' + err.message));
-}
-
-document.getElementById('clipEnabled').addEventListener('change', e => saveClipboard({ enabled: e.target.checked }));
-document.getElementById('clipImages').addEventListener('change', e => saveClipboard({ images: e.target.checked }));
-document.getElementById('clipMax').addEventListener('change', e => saveClipboard({ max_mb: Number(e.target.value) }));
-document.getElementById('clipFiles').addEventListener('change', e => saveClipboard({ files: e.target.checked }));
-document.getElementById('clipFileMax').addEventListener('change', e => saveClipboard({ max_file_mb: Number(e.target.value) }));
-
-// ------------------------------------------------------------ 更新
-
-function fmtTime(sec) {
-  if (!sec) return '尚未检查';
-  const d = new Date(sec * 1000);
-  return `上次检查：${d.toLocaleDateString()} ${d.toLocaleTimeString().slice(0, 5)}`;
-}
-
-function renderUpdate() {
-  const u = state.update;
-  document.getElementById('hostVer').textContent = ` · v${state.version}`;
-  document.getElementById('updInfo').textContent = `当前版本 v${state.version} · ${fmtTime(u.last_checked)}`;
-  setValue(document.getElementById('mirror'), state.update_mirror || '');
-
-  const banner = document.getElementById('updateBanner');
-  const show = u.available || u.phase || u.error || u.devices.length;
-  banner.hidden = !show;
-  if (!show) return;
-  const results = u.devices.length
-    ? `<div class="muted" style="font-size:12px;margin-top:4px">${u.devices.map(([n, r]) => `${esc(n)}：${esc(r)}`).join('；')}</div>` : '';
-  let body, action = '';
-  if (u.phase) {
-    body = `<b>${esc(u.phase)}</b>`;
-  } else if (u.error) {
-    body = `<b style="color:var(--danger)">${esc(u.error)}</b>`;
-    action = u.available ? '<button class="primary" id="applyUpdate">重试</button>' : '';
-  } else if (u.available) {
-    body = `<b>发现新版本 v${esc(u.latest.version)}</b>（当前 v${esc(state.version)}）
-      ${u.latest.notes ? `<details><summary>更新内容</summary>${esc(u.latest.notes)}</details>` : ''}`;
-    action = '<button class="primary" id="applyUpdate">更新所有设备</button>';
-  } else {
-    body = '<b>更新完成</b>';
-  }
-  setHtml(banner, `<div class="body">${body}${results}</div>${action}`);
-}
-
-document.getElementById('updateBanner').addEventListener('click', async e => {
-  if (e.target.id !== 'applyUpdate') return;
-  if (!confirm('将先把新版本推送给所有在线设备，再更新本机。更新期间会短暂断开（约几秒）。继续吗？')) return;
-  try { await api('POST', '/api/update/apply'); refresh(); }
-  catch (err) { toast(err.message); }
-});
-
-document.getElementById('checkUpdate').addEventListener('click', async e => {
-  e.target.disabled = true;
-  try {
-    const available = await api('POST', '/api/update/check');
-    toast(available ? '发现新版本' : '已经是最新版本');
-  } catch (err) {
-    toast(err.message);
-  } finally {
-    e.target.disabled = false;
-    refresh();
-  }
-});
-
-document.getElementById('mirror').addEventListener('change', e => {
-  api('PUT', '/api/settings', { update_mirror: e.target.value }).then(() => toast('已保存')).catch(err => toast(err.message));
-});
-
-// ------------------------------------------------------------ 文件传输
-
-function renderTransfers() {
-  const list = state.transfers;
-  document.getElementById('transferSection').hidden = !list.length;
-  setHtml(document.getElementById('transferList'), list.slice(0, 6).map(t => {
-    const pct = t.total ? Math.floor(t.done * 100 / t.total) : 100;
-    const arrow = t.direction === 'send' ? '发给' : '来自';
-    const st = t.state === 'running' ? `${pct}%` : t.state === 'done' ? '完成' : '失败';
-    return `<div class="transfer ${t.state}">
-      <div class="row"><span>${esc(t.title)}</span><span class="muted">${st}</span></div>
-      <div class="muted" style="font-size:12px">${arrow}「${esc(t.peer)}」· ${t.files} 个文件 · ${fmtBytes(t.total)}</div>
-      ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
-      <div class="bar"><div style="width:${t.state === 'failed' ? 100 : pct}%"></div></div>
-    </div>`;
-  }).join(''));
-}
-
-function fmtBytes(n) {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-  return i ? `${n.toFixed(1)} ${units[i]}` : `${n} B`;
-}
-
-document.getElementById('openDownloads').addEventListener('click', () => api('POST', '/api/open-downloads'));
-
-// ------------------------------------------------------------ 单台设备设置
-
-function selectDevice(id) {
-  selectedId = selectedId === id ? null : id;
-  editorFor = null;
   render();
 }
 
-let editorFor = null;
+function render() {
+  const isHost = state.role === 'host';
+  $('myName').textContent = state.name;
+  $('myVer').textContent = `v${state.version}`;
+  $('myInfo').textContent = `${OS[state.os] || ''} · 设备 ID ${state.id.slice(0, 10)}`;
+  document.querySelectorAll('.role').forEach(r => r.classList.toggle('selected', r.dataset.role === state.role));
+  document.querySelectorAll('[data-host]').forEach(b => b.hidden = !isHost);
+  if (!isHost && document.querySelector(`#tabs [data-tab="${tab}"]`).hidden) switchTab('devices');
+  $('hostDevices').hidden = !isHost;
+  $('clientDevices').hidden = isHost;
+  $('hostUpdate').hidden = !isHost;
+  $('clientUpdate').hidden = isHost;
 
-function renderEditor() {
-  const box = document.getElementById('deviceEditor');
-  const dev = state.devices.find(d => d.id === selectedId && !d.is_host);
-  box.hidden = !dev;
-  if (!dev) return;
-  // 每台设备只构建一次，之后只更新数值，拖动滑块时不会被刷新打断
-  if (editorFor !== dev.id) {
-    editorFor = dev.id;
-    box.innerHTML = `
-      <h2>设备设置</h2>
-      <div class="field" style="margin-top:0">
-        <div class="head"><span>名称</span></div>
-        <input type="text" id="edName" maxlength="40">
-      </div>
-      <label class="toggle field"><input type="checkbox" id="edEnabled"><span>启用这台设备<br><span class="muted">停用后不参与切屏，配置和布局都保留</span></span></label>
+  if (isHost) renderHost(); else renderClient();
+  renderTransfers(isHost ? 'transferList' : 'clientTransferList', isHost ? 'transferCard' : 'clientTransferCard');
+}
+
+function setStatus(text, kind) {
+  const pill = $('statusPill');
+  pill.classList.toggle('active', kind === 'active');
+  pill.querySelector('.dot').className = 'dot' + (kind === 'active' || kind === 'on' ? ' on' : kind === 'wait' ? ' wait' : '');
+  pill.lastElementChild.textContent = text;
+  pill.title = text;
+}
+
+// ------------------------------------------------------------ 主机
+
+function renderHost() {
+  const h = state.host;
+  const focused = h.devices.find(d => d.id === h.focused);
+  const online = h.devices.filter(d => !d.is_host && d.online).length;
+  if (h.paused) setStatus('已暂停切屏', 'wait');
+  else if (focused) setStatus(`正在控制「${focused.name}」`, 'active');
+  else setStatus(`在本机 · ${online} 台设备在线`, 'on');
+
+  // 提示横幅：权限、配对、更新
+  const banners = [];
+  if (!h.capture_ok && h.capture_message) banners.push(`<div class="banner"><span class="grow">${esc(h.capture_message)}</span></div>`);
+  for (const d of h.devices.filter(d => d.pending_code)) {
+    banners.push(`<div class="banner info"><span class="grow">请在「${esc(d.name)}」弹出的窗口里确认连接请求，并核对两边的校验码一致</span><span class="code">${esc(d.pending_code)}</span></div>`);
+  }
+  const u = h.update;
+  if (u.phase) banners.push(`<div class="banner info"><span class="grow">${esc(u.phase)}</span></div>`);
+  else if (u.available) banners.push(`<div class="banner good"><span class="grow">发现新版本 <b>v${esc(u.latest.version)}</b>（当前 v${esc(state.version)}）</span><button class="primary" data-apply-update>更新所有设备</button></div>`);
+  setHtml($('banners'), banners.join(''));
+
+  const lock = $('lockBtn'); lock.classList.toggle('on', h.edge_locked); lock.textContent = h.edge_locked ? '已锁定' : '锁定当前屏幕';
+  const pause = $('pauseBtn'); pause.classList.toggle('on', h.paused); pause.textContent = h.paused ? '已暂停' : '暂停';
+
+  renderGrid();
+  renderDetail();
+  renderSwitching();
+  renderClipboard();
+  renderUpdate();
+}
+
+function deviceNumber(d) {
+  if (d.is_host) return 1;
+  if (d.settings && !d.settings.enabled) return null;
+  const list = state.host.devices.filter(x => !x.is_host && (!x.settings || x.settings.enabled));
+  const i = list.findIndex(x => x.id === d.id);
+  return i >= 0 && i < 8 ? i + 2 : null;
+}
+
+function renderGrid() {
+  const h = state.host;
+  const [cols, rows] = h.grid;
+  const grid = $('grid');
+  grid.style.setProperty('--cols', cols);
+  let html = '';
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const d = h.devices.find(d => d.cell && d.cell.col === c && d.cell.row === r);
+    let tile = '';
+    if (d) {
+      const disabled = d.settings && !d.settings.enabled;
+      const live = d.online && !disabled;
+      const status = d.is_host ? '本机' : d.pending_code ? '待确认' : disabled ? '已停用' : d.online ? (d.path || '在线') : '离线';
+      const n = deviceNumber(d);
+      tile = `<div class="tile ${live ? '' : 'offline'} ${selectedId === d.id ? 'selected' : ''} ${h.focused === d.id ? 'focused' : ''}"
+                   draggable="true" data-id="${d.id}" title="${esc(d.name)}">
+        ${n ? `<span class="num">${n}</span>` : ''}${d.is_host ? '<span class="badge-host">主机</span>' : ''}
+        <div class="screen"></div>
+        <div class="label">${esc(d.name)}</div>
+        <div class="meta"><span class="dot ${live ? 'on' : d.pending_code ? 'wait' : ''}"></span>${esc(OS[d.os] || '')} · ${esc(status)}</div>
+      </div>`;
+    }
+    html += `<div class="cell" data-col="${c}" data-row="${r}">${tile}</div>`;
+  }
+  setHtml(grid, html);
+}
+
+$('grid').addEventListener('click', e => {
+  const tile = e.target.closest('.tile');
+  selectedId = tile ? (selectedId === tile.dataset.id ? null : tile.dataset.id) : null;
+  detailFor = null;
+  render();
+});
+$('grid').addEventListener('dragstart', e => {
+  const tile = e.target.closest('.tile'); if (!tile) return;
+  dragId = tile.dataset.id;
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', dragId);
+});
+$('grid').addEventListener('dragover', e => {
+  const cell = e.target.closest('.cell'); if (!cell || !dragId) return;
+  e.preventDefault();
+  document.querySelectorAll('.cell.over').forEach(c => c !== cell && c.classList.remove('over'));
+  cell.classList.add('over');
+});
+$('grid').addEventListener('dragleave', e => { const cell = e.target.closest('.cell'); if (cell && !cell.contains(e.relatedTarget)) cell.classList.remove('over'); });
+$('grid').addEventListener('drop', async e => {
+  e.preventDefault();
+  const cell = e.target.closest('.cell');
+  document.querySelectorAll('.cell.over').forEach(c => c.classList.remove('over'));
+  const id = dragId; dragId = null;
+  if (!cell || !id) return;
+  try {
+    await api('PUT', `/api/grid/${encodeURIComponent(id)}`, { col: Number(cell.dataset.col), row: Number(cell.dataset.row) });
+    refresh();
+  } catch (err) { toast(err.message); }
+});
+$('grid').addEventListener('dragend', () => { dragId = null; document.querySelectorAll('.cell.over').forEach(c => c.classList.remove('over')); });
+
+// ---------- 右侧详情：选中设备时显示设备设置，否则显示添加设备
+
+function renderDetail() {
+  const h = state.host;
+  const d = h.devices.find(x => x.id === selectedId);
+  if (!d) { selectedId = null; renderAddPanel(); return; }
+  if (d.is_host) {
+    detailFor = null;
+    setHtml($('detail'), `<h3>${esc(d.name)} <span class="muted small">（本机 · 主机）</span></h3>
+      <div class="kv"><span class="k">系统</span><span>${esc(OS[d.os] || '')}</span>
+      <span class="k">显示器</span><span>${screens(d)}</span>
+      <span class="k">键鼠采集</span><span>${h.capture_ok ? '<span style="color:var(--ok)">正常</span>' : '未就绪'}</span></div>
+      <p class="muted small" style="margin:8px 0 0">把其他电脑拖到本机旁边的格子里，光标就能从对应的那一边穿过去。</p>
+      <button class="link small" data-deselect style="margin-top:8px">← 返回添加设备</button>`);
+    return;
+  }
+  const s = d.settings;
+  if (detailFor !== d.id) {
+    detailFor = d.id;
+    $('detail')._html = null;
+    $('detail').innerHTML = `
+      <div class="row"><input type="text" id="edName" maxlength="40" class="grow" title="名称"><button class="link small" data-deselect>完成</button></div>
+      <div id="edInfo" style="margin:6px 0 4px"></div>
+      <label class="check"><input type="checkbox" id="edEnabled"><span>启用这台设备</span></label>
       <div class="field">
         <div class="head"><span>指针速度</span><span class="val" id="edPointerVal"></span></div>
         <input type="range" id="edPointer" min="0.25" max="3" step="0.05">
@@ -1002,70 +648,289 @@ function renderEditor() {
         <div class="head"><span>滚轮速度</span><span class="val" id="edScrollVal"></span></div>
         <input type="range" id="edScroll" min="0.25" max="5" step="0.05">
       </div>
-      <label class="toggle field"><input type="checkbox" id="edInvY"><span>反转纵向滚动<br><span class="muted">控制这台设备时，上下滚动方向相反</span></span></label>
-      <label class="toggle field"><input type="checkbox" id="edInvX"><span>反转横向滚动</span></label>
-      <label class="toggle field"><input type="checkbox" id="edClip"><span>同步剪贴板<br><span class="muted">需要同时打开下方「剪贴板同步」总开关</span></span></label>
-      <button id="edReset">恢复默认</button>`;
-    const s = () => state.devices.find(d => d.id === editorFor).settings;
-    const bind = (id, ev, fn) => document.getElementById(id).addEventListener(ev, fn);
+      <label class="check"><input type="checkbox" id="edInvY"><span>反转纵向滚动</span></label>
+      <label class="check"><input type="checkbox" id="edInvX"><span>反转横向滚动</span></label>
+      <label class="check"><input type="checkbox" id="edClip"><span>同步剪贴板和文件</span></label>
+      <div class="row" style="margin-top:10px"><button class="small" id="edReset">恢复默认</button><span class="grow"></span><button class="small danger" id="edRemove">移除</button></div>`;
+    const cur = () => state.host.devices.find(x => x.id === detailFor);
+    const bind = (id, ev, fn) => $(id).addEventListener(ev, fn);
     bind('edName', 'change', e => savePeer({ name: e.target.value }));
-    bind('edEnabled', 'change', e => savePeer({ settings: { ...s(), enabled: e.target.checked } }));
-    bind('edPointer', 'input', e => savePeer({ settings: { ...s(), pointer_speed: Number(e.target.value) } }));
-    bind('edScroll', 'input', e => savePeer({ settings: { ...s(), scroll_speed: Number(e.target.value) } }));
-    bind('edInvY', 'change', e => savePeer({ settings: { ...s(), invert_scroll_y: e.target.checked } }));
-    bind('edInvX', 'change', e => savePeer({ settings: { ...s(), invert_scroll_x: e.target.checked } }));
-    bind('edClip', 'change', e => savePeer({ settings: { ...s(), clipboard: e.target.checked } }));
-    bind('edReset', 'click', () => savePeer({ settings: { enabled: s().enabled, clipboard: s().clipboard, pointer_speed: 1, scroll_speed: 1, invert_scroll_y: false, invert_scroll_x: false } }));
+    bind('edEnabled', 'change', e => savePeer({ settings: { ...cur().settings, enabled: e.target.checked } }));
+    bind('edPointer', 'input', e => savePeer({ settings: { ...cur().settings, pointer_speed: Number(e.target.value) } }));
+    bind('edScroll', 'input', e => savePeer({ settings: { ...cur().settings, scroll_speed: Number(e.target.value) } }));
+    bind('edInvY', 'change', e => savePeer({ settings: { ...cur().settings, invert_scroll_y: e.target.checked } }));
+    bind('edInvX', 'change', e => savePeer({ settings: { ...cur().settings, invert_scroll_x: e.target.checked } }));
+    bind('edClip', 'change', e => savePeer({ settings: { ...cur().settings, clipboard: e.target.checked } }));
+    bind('edReset', 'click', () => savePeer({ settings: { ...cur().settings, pointer_speed: 1, scroll_speed: 1, invert_scroll_y: false, invert_scroll_x: false } }));
+    bind('edRemove', 'click', async () => {
+      if (!confirm(`移除「${cur().name}」？之后需要重新添加才能控制它。`)) return;
+      try { await api('DELETE', `/api/peers/${encodeURIComponent(detailFor)}`); selectedId = null; detailFor = null; refresh(); }
+      catch (err) { toast(err.message); }
+    });
   }
-  const st = dev.settings;
-  setValue(document.getElementById('edName'), dev.name);
-  setValue(document.getElementById('edEnabled'), st.enabled);
-  setValue(document.getElementById('edPointer'), st.pointer_speed);
-  setValue(document.getElementById('edScroll'), st.scroll_speed);
-  setValue(document.getElementById('edInvY'), st.invert_scroll_y);
-  setValue(document.getElementById('edInvX'), st.invert_scroll_x);
-  setValue(document.getElementById('edClip'), st.clipboard);
-  document.getElementById('edPointerVal').textContent = `${st.pointer_speed.toFixed(2)}×`;
-  document.getElementById('edScrollVal').textContent = `${st.scroll_speed.toFixed(2)}×`;
+  setValue($('edName'), d.name);
+  setValue($('edEnabled'), s.enabled);
+  setValue($('edPointer'), s.pointer_speed);
+  setValue($('edScroll'), s.scroll_speed);
+  setValue($('edInvY'), s.invert_scroll_y);
+  setValue($('edInvX'), s.invert_scroll_x);
+  setValue($('edClip'), s.clipboard);
+  $('edPointerVal').textContent = `${s.pointer_speed.toFixed(2)}×`;
+  $('edScrollVal').textContent = `${s.scroll_speed.toFixed(2)}×`;
+
+  const verOld = d.online && d.version && d.version !== state.version;
+  const status = d.online ? `<span style="color:var(--ok)">在线</span> · ${esc(d.path || '')} ${rttText(d.rtt_ms)}`
+    : d.pending_code ? `<span class="pending">等待对方确认 · 校验码 ${esc(d.pending_code)}</span>`
+    : d.denied ? '已被拒绝' : d.displays.length ? '离线' : '正在连接…';
+  setHtml($('edInfo'), `<div class="kv">
+      <span class="k">状态</span><span>${status}</span>
+      <span class="k">系统</span><span>${esc(OS[d.os] || '未知')}${d.displays.length ? ' · ' + screens(d) : ''}</span>
+      <span class="k">版本</span><span>${d.version ? 'v' + esc(d.version) : '—'} ${verOld ? `<button class="link small" data-syncver="${d.id}">同步到 v${esc(state.version)}</button>` : ''}</span>
+    </div>
+    ${!d.online && d.error ? `<div class="err">${esc(d.error)}</div>` : ''}
+    ${!d.online && (d.denied || d.error) ? `<button class="small" data-retry="${d.id}" style="margin-top:6px">重新连接</button>` : ''}`);
 }
 
 let peerTimer;
 function savePeer(patch) {
-  const dev = state.devices.find(d => d.id === editorFor);
-  if (!dev) return;
-  if (patch.settings) dev.settings = patch.settings;
-  if (patch.name) dev.name = patch.name;
-  renderEditor();
-  renderList();
-  const id = dev.id;
+  const d = state.host.devices.find(x => x.id === detailFor); if (!d) return;
+  if (patch.settings) d.settings = patch.settings;
+  if (patch.name) d.name = patch.name;
+  renderDetail(); renderGrid();
   clearTimeout(peerTimer);
-  peerTimer = setTimeout(() => {
-    api('PUT', `/api/peers/${encodeURIComponent(id)}/settings`, { name: dev.name, settings: dev.settings })
-      .catch(err => toast('保存失败：' + err.message));
-  }, 250);
+  peerTimer = setTimeout(() => api('PUT', `/api/peers/${encodeURIComponent(d.id)}/settings`, { name: d.name, settings: d.settings }).catch(err => toast('保存失败：' + err.message)), 250);
 }
 
-// ------------------------------------------------------------ 杂项
-
-// 内容没变就不动 DOM：每秒刷新时重建元素会吞掉正在进行的点击
-function setHtml(el, html) {
-  if (el._html !== html) { el.innerHTML = html; el._html = html; }
+function renderAddPanel() {
+  detailFor = null;
+  const nearby = state.host.nearby;
+  const detail = $('detail');
+  // 正在输入连接码时不要重建，否则会清空输入框
+  if (detail.contains(document.activeElement) && document.activeElement.matches('textarea, input')) return;
+  setHtml(detail, `
+    <h3>添加设备</h3>
+    ${nearby.length ? `<div class="muted small" style="margin-bottom:6px">附近的设备（同一局域网，已打开 Roam 被控端）</div>
+      ${nearby.map(n => `<div class="list-item"><span class="dot on"></span><div class="grow"><div class="title">${esc(n.name)}</div><div class="muted small">${esc(OS[n.os] || '')}</div></div><button class="primary small" data-add="${n.id}">添加</button></div>`).join('')}`
+    : `<p class="muted small" style="margin:0 0 6px">还没有发现附近的设备。在另一台电脑上打开 Roam，选择「被其他电脑控制」，它就会出现在这里。</p>`}
+    <div class="field" style="margin-top:14px">
+      <div class="head"><span>跨网络：粘贴对方的连接码</span></div>
+      <textarea id="addTicket" rows="3" placeholder="roam1..."></textarea>
+    </div>
+    <div class="row"><input type="text" id="addName" placeholder="名称（可选）" class="grow"><button class="primary" id="addBtn">添加</button></div>
+    <p class="muted small" style="margin:12px 0 0">点击网格里的电脑可以单独设置速度、滚轮方向等。</p>`);
 }
 
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-function showBanner(msg) { const b = document.getElementById('banner'); b.textContent = msg; b.hidden = false; }
-function hideBanner() { document.getElementById('banner').hidden = true; }
-let toastTimer;
-function toast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg; t.classList.add('show');
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
-}
+$('detail').addEventListener('click', async e => {
+  const t = e.target;
+  if (t.dataset.deselect !== undefined) { selectedId = null; detailFor = null; render(); return; }
+  if (t.dataset.add) {
+    const n = state.host.nearby.find(x => x.id === t.dataset.add); if (!n) return;
+    t.disabled = true;
+    try { await api('POST', '/api/peers', { ticket: n.ticket, name: n.name }); toast(`已添加「${n.name}」，请在对方屏幕上确认连接请求`); refresh(); }
+    catch (err) { toast(err.message); t.disabled = false; }
+    return;
+  }
+  if (t.id === 'addBtn') {
+    const ticket = $('addTicket').value.trim(); if (!ticket) return toast('请先粘贴连接码');
+    try { await api('POST', '/api/peers', { ticket, name: $('addName').value.trim() || null }); $('addTicket').value = ''; $('addName').value = ''; toast('已添加，正在连接…'); refresh(); }
+    catch (err) { toast(err.message); }
+    return;
+  }
+  if (t.dataset.retry) { try { await api('POST', `/api/peers/${encodeURIComponent(t.dataset.retry)}/retry`); toast('正在重新连接…'); } catch (err) { toast(err.message); } return; }
+  if (t.dataset.syncver) { try { await api('POST', `/api/peers/${encodeURIComponent(t.dataset.syncver)}/sync-version`); toast('正在同步版本…'); } catch (err) { toast(err.message); } }
+});
 
-// 画布尺寸变化（窗口缩放、页面从后台切到前台）时重新适配
-new ResizeObserver(() => { if (!drag) { fitView(); render(); } }).observe(stage);
+$('lockBtn').addEventListener('click', () => api('PUT', '/api/lock', { locked: !state.host.edge_locked }).then(refresh).catch(err => toast(err.message)));
+$('pauseBtn').addEventListener('click', () => api('PUT', '/api/pause', { paused: !state.host.paused }).then(refresh).catch(err => toast(err.message)));
+
+// ---------- 切屏
+
+function renderSwitching() {
+  const sw = state.host.switching;
+  const mode = sw.double_tap ? 'double' : sw.dwell_ms > 0 ? 'dwell' : 'instant';
+  document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
+  $('dwellField').hidden = mode !== 'dwell';
+  $('tapField').hidden = mode !== 'double';
+  setValue($('dwell'), sw.dwell_ms || 250); $('dwellVal').textContent = `${sw.dwell_ms || 250} ms`;
+  setValue($('tapWindow'), sw.double_tap_window_ms); $('tapVal').textContent = `${sw.double_tap_window_ms} ms`;
+  setValue($('requireMod'), sw.require_modifier || '');
+  setValue($('corner'), sw.corner_deadzone); $('cornerVal').textContent = sw.corner_deadzone ? `${Math.round(sw.corner_deadzone)} pt` : '关闭';
+  setValue($('swapCmd'), state.host.swap_cmd_ctrl);
+  setValue($('hotkeyMods'), sw.hotkey_modifiers.join(','));
+  const combo = sw.hotkey_modifiers.map(m => `<kbd>${MOD[m]}</kbd>`).join(' + ');
+  const numbered = state.host.devices.map(d => [deviceNumber(d), d.name]).filter(([n]) => n)
+    .map(([n, name]) => `${combo} + <kbd>${n}</kbd>　切到「${esc(name)}」`).join('<br>');
+  setHtml($('hotkeyHelp'), `${combo} + <kbd>Esc</kbd>　回到本机<br>${numbered}<br>${combo} + <kbd>L</kbd>　锁定 / 解锁当前屏幕`);
+}
+let swTimer;
+function saveSwitching(patch) {
+  Object.assign(state.host.switching, patch); renderSwitching();
+  clearTimeout(swTimer);
+  swTimer = setTimeout(() => api('PUT', '/api/settings', { switching: state.host.switching }).catch(err => toast('保存失败：' + err.message)), 250);
+}
+$('modeSeg').addEventListener('click', e => {
+  const m = e.target.dataset?.mode; if (!m) return;
+  saveSwitching({ double_tap: m === 'double', dwell_ms: m === 'dwell' ? (Number($('dwell').value) || 250) : 0 });
+});
+$('dwell').addEventListener('input', e => saveSwitching({ dwell_ms: Number(e.target.value) }));
+$('tapWindow').addEventListener('input', e => saveSwitching({ double_tap_window_ms: Number(e.target.value) }));
+$('requireMod').addEventListener('change', e => saveSwitching({ require_modifier: e.target.value || null }));
+$('corner').addEventListener('input', e => saveSwitching({ corner_deadzone: Number(e.target.value) }));
+$('hotkeyMods').addEventListener('change', e => saveSwitching({ hotkey_modifiers: e.target.value.split(',') }));
+$('swapCmd').addEventListener('change', e => api('PUT', '/api/settings', { swap_cmd_ctrl: e.target.checked }).catch(err => toast(err.message)));
+
+// ---------- 剪贴板
+
+function renderClipboard() {
+  const c = state.host.clipboard;
+  setValue($('clipEnabled'), c.enabled); setValue($('clipImages'), c.images);
+  setValue($('clipMax'), String(c.max_mb)); setValue($('clipFiles'), c.files);
+  setValue($('clipFileMax'), String(c.max_file_mb));
+  ['clipImages', 'clipMax', 'clipFiles'].forEach(id => $(id).disabled = !c.enabled);
+  $('clipFileMax').disabled = !c.enabled || !c.files;
+}
+function saveClipboard(patch) {
+  Object.assign(state.host.clipboard, patch); renderClipboard();
+  api('PUT', '/api/settings', { clipboard: state.host.clipboard }).catch(err => toast('保存失败：' + err.message));
+}
+$('clipEnabled').addEventListener('change', e => saveClipboard({ enabled: e.target.checked }));
+$('clipImages').addEventListener('change', e => saveClipboard({ images: e.target.checked }));
+$('clipMax').addEventListener('change', e => saveClipboard({ max_mb: Number(e.target.value) }));
+$('clipFiles').addEventListener('change', e => saveClipboard({ files: e.target.checked }));
+$('clipFileMax').addEventListener('change', e => saveClipboard({ max_file_mb: Number(e.target.value) }));
+
+// ---------- 更新
+
+function renderUpdate() {
+  const u = state.host.update;
+  const checked = u.last_checked ? new Date(u.last_checked * 1000).toLocaleString() : '尚未检查';
+  $('updInfo').textContent = `当前版本 v${state.version} · 上次检查：${checked}`;
+  setValue($('mirror'), state.host.update_mirror || '');
+  const parts = [];
+  if (u.available) parts.push(`<b>发现新版本 v${esc(u.latest.version)}</b> <button class="primary small" data-apply-update>更新所有设备</button>${u.latest.notes ? `<pre class="muted" style="white-space:pre-wrap;margin:8px 0 0">${esc(u.latest.notes)}</pre>` : ''}`);
+  else if (u.latest) parts.push('<span style="color:var(--ok)">已经是最新版本</span>');
+  if (u.error) parts.push(`<div class="err">${esc(u.error)}</div>`);
+  if (u.devices.length) parts.push(`<div class="muted" style="margin-top:6px">${u.devices.map(([n, r]) => `${esc(n)}：${esc(r)}`).join('；')}</div>`);
+  setHtml($('updResult'), parts.join(''));
+}
+$('checkUpdate').addEventListener('click', async e => {
+  e.target.disabled = true;
+  try { toast(await api('POST', '/api/update/check') ? '发现新版本' : '已经是最新版本'); }
+  catch (err) { toast(err.message); }
+  finally { e.target.disabled = false; refresh(); }
+});
+$('mirror').addEventListener('change', e => api('PUT', '/api/settings', { update_mirror: e.target.value }).then(() => toast('已保存')).catch(err => toast(err.message)));
+document.addEventListener('click', async e => {
+  if (e.target.dataset?.applyUpdate === undefined) return;
+  if (!confirm('将先把新版本推送给所有在线设备，再更新本机。更新期间会短暂断开几秒。继续吗？')) return;
+  try { await api('POST', '/api/update/apply'); refresh(); } catch (err) { toast(err.message); }
+});
+
+// ------------------------------------------------------------ 被控端
+
+function renderClient() {
+  const c = state.client;
+  setStatus(c.status, c.pending ? 'wait' : c.host ? 'active' : 'idle');
+  const banners = [];
+  if (c.permission) banners.push(`<div class="banner"><span class="grow">${esc(c.permission)}</span></div>`);
+  if (c.pending) banners.push(`<div class="banner info"><span class="grow">「${esc(c.pending[0])}」请求控制本机，请在弹出的窗口里确认</span><span class="code">${esc(c.pending[1])}</span></div>`);
+  setHtml($('banners'), banners.join(''));
+
+  const st = $('clientStatus');
+  st.querySelector('.dot').className = 'dot' + (c.host ? ' on' : c.pending ? ' wait' : '');
+  st.lastElementChild.textContent = c.host ? `已被「${c.host.name}」控制` : c.pending ? '等待确认…' : '等待主机连接';
+  setHtml($('clientHostInfo'), c.host ? `
+    <span class="k">主机系统</span><span>${esc(OS[c.host.os] || '')}</span>
+    <span class="k">连接路径</span><span>${esc(c.host.path || '—')} ${rttText(c.host.rtt_ms)}</span>
+    <span class="k">主机版本</span><span>v${esc(c.host.version)}</span>` : '');
+  setHtml($('ticket'), esc(c.ticket));
+  setHtml($('trustedList'), c.trusted.length
+    ? c.trusted.map(t => `<div class="list-item"><span class="dot ${c.host && c.host.id === t.id ? 'on' : ''}"></span><div class="grow title">${esc(t.name)}</div><button class="small danger" data-revoke="${t.id}">撤销</button></div>`).join('')
+    : '<p class="muted small" style="margin:0">还没有授权任何主机。主机第一次连接时会弹窗请你确认。</p>');
+}
+$('copyTicket').addEventListener('click', () => api('POST', '/api/copy-ticket').then(() => toast('连接码已复制')).catch(err => toast(err.message)));
+$('trustedList').addEventListener('click', async e => {
+  const id = e.target.dataset?.revoke; if (!id) return;
+  if (!confirm('撤销后，这台主机下次连接时需要重新确认。继续吗？')) return;
+  try { await api('DELETE', `/api/trusted/${encodeURIComponent(id)}`); refresh(); } catch (err) { toast(err.message); }
+});
+
+// ------------------------------------------------------------ 通用
+
+function renderTransfers(listId, cardId) {
+  const list = state.transfers;
+  $(cardId).hidden = !list.length;
+  setHtml($(listId), list.slice(0, 5).map(t => {
+    const pct = t.total ? Math.floor(t.done * 100 / t.total) : 100;
+    const st = t.state === 'running' ? `${pct}%` : t.state === 'done' ? '完成' : '失败';
+    return `<div class="transfer ${t.state}">
+      <div class="row"><span class="grow title">${esc(t.title)}</span><span class="muted small">${st}</span></div>
+      <div class="muted small">${t.direction === 'send' ? '发给' : '来自'}「${esc(t.peer)}」· ${t.files} 个文件 · ${fmtBytes(t.total)}</div>
+      ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
+      <div class="bar"><div style="width:${t.state === 'failed' ? 100 : pct}%"></div></div></div>`;
+  }).join(''));
+}
+document.addEventListener('click', e => { if (e.target.dataset?.openDownloads !== undefined) api('POST', '/api/open-downloads'); });
+
+function switchTab(name) {
+  tab = name;
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab').forEach(p => p.classList.toggle('active', p.dataset.panel === name));
+  if (name === 'logs') loadLogs(true);
+}
+$('tabs').addEventListener('click', e => { if (e.target.dataset?.tab) switchTab(e.target.dataset.tab); });
+
+document.querySelectorAll('.role').forEach(r => r.addEventListener('click', async () => {
+  const role = r.dataset.role;
+  if (!state || role === state.role) return;
+  const msg = role === 'host'
+    ? '切换为主机后，本机的键盘和鼠标可以控制其他电脑，本机不再接受其他电脑控制。\n\nRoam 会自动重启，继续吗？'
+    : '切换为被控端后，本机将等待其他电脑来控制，本机的键鼠不再控制其他电脑。\n\nRoam 会自动重启，继续吗？';
+  if (!confirm(msg)) return;
+  try { await api('PUT', '/api/role', { role }); } catch (err) { return toast(err.message); }
+  $('overlay').textContent = '正在切换角色，Roam 正在重启…';
+  $('overlay').hidden = false;
+  const started = Date.now();
+  const poll = setInterval(async () => {
+    try {
+      const s = await (await fetch('/api/state')).json();
+      if (s.role === role) { clearInterval(poll); location.reload(); }
+    } catch {}
+    if (Date.now() - started > 30000) { clearInterval(poll); $('overlay').textContent = '重启时间较长，请稍后重新打开 Roam'; }
+  }, 700);
+}));
+
+$('renameBtn').addEventListener('click', async () => {
+  const name = prompt('本机名称（其他电脑上显示的名字）', state.name);
+  if (!name || name.trim() === state.name) return;
+  try { await api('PUT', '/api/name', { name: name.trim() }); refresh(); toast('已修改，下次连接时其他电脑会看到新名字'); }
+  catch (err) { toast(err.message); }
+});
+
+// ---------- 日志
+
+let logTimer;
+async function loadLogs(scrollToEnd) {
+  clearTimeout(logTimer);
+  if (tab !== 'logs') return;
+  try {
+    const lines = await (await fetch('/api/logs')).json();
+    const box = $('logs');
+    const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+    setHtml(box, lines.map(l => {
+      const cls = / WARN /.test(l) ? 'warn' : / ERROR /.test(l) ? 'error' : '';
+      return `<div class="${cls}">${esc(l)}</div>`;
+    }).join(''));
+    if (scrollToEnd || atBottom) box.scrollTop = box.scrollHeight;
+  } catch {}
+  logTimer = setTimeout(() => loadLogs(false), 2000);
+}
+$('openLogs').addEventListener('click', () => api('POST', '/api/open-logs'));
+$('copyLogs').addEventListener('click', async () => {
+  const text = [...$('logs').children].map(d => d.textContent).join('\n');
+  try { await navigator.clipboard.writeText(text); toast('已复制'); } catch { toast('复制失败，请在日志文件夹里查看'); }
+});
+
 refresh();
 setInterval(refresh, 1000);
 </script>

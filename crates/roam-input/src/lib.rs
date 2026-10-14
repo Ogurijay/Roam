@@ -18,16 +18,19 @@ pub fn displays() -> Vec<DisplayInfo> {
 }
 
 /// 本平台能否作为被控端注入输入。
-pub const CAN_INJECT: bool = cfg!(windows);
+pub const CAN_INJECT: bool = cfg!(any(windows, target_os = "macos"));
 
 #[cfg(windows)]
 pub use windows::Injector;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub use mac::Injector;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub use stub::Injector;
 
-/// 非 Windows 平台的占位实现，保证主程序在所有平台都能编译。
-#[cfg(not(windows))]
+/// 其他平台的占位实现，保证主程序在所有平台都能编译。
+#[cfg(not(any(windows, target_os = "macos")))]
 mod stub {
     use roam_proto::MouseButton;
 

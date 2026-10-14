@@ -77,6 +77,11 @@ impl Nearby {
         list.sort_by(|a, b| a.name.cmp(&b.name));
         list
     }
+
+    /// 局域网里广播的、某台设备当前的信息（连接码是最新的）。
+    pub fn get(&self, id: &str) -> Option<Discovered> {
+        self.inner.lock().unwrap().get(id).map(|(_, d)| d.clone())
+    }
 }
 
 /// 在后台线程中持续浏览，返回的守护进程句柄需要保持存活。

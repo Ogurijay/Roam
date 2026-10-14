@@ -13,12 +13,19 @@ use anyhow::{Context, Result};
 use roam_proto::{DisplayInfo, Os};
 use serde::{Deserialize, Serialize};
 
-use crate::settings::{ClipboardSettings, DeviceSettings, SwitchSettings};
+use crate::{
+    layout::Cell,
+    settings::{ClipboardSettings, DeviceSettings, SwitchSettings},
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Point {
-    pub x: f64,
-    pub y: f64,
+/// 本机的角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// 用本机键鼠控制其他电脑。
+    Host,
+    /// 被其他电脑控制。
+    Client,
 }
 
 /// 主机记录的一台被控设备。
@@ -46,9 +53,15 @@ pub struct Config {
     /// 被控端：允许控制本机的主机 ID。
     #[serde(default)]
     pub trusted_hosts: Vec<String>,
-    /// 设备 ID → 设备外框左上角在全局布局中的位置。
+    /// 被控端：已授权主机的名字（显示用）。
     #[serde(default)]
-    pub layout: BTreeMap<String, Point>,
+    pub host_names: BTreeMap<String, String>,
+    /// 本机角色；未设置时 macOS 默认主机，其他系统默认被控端。
+    #[serde(default)]
+    pub role: Option<Role>,
+    /// 主机：每台设备（含主机自己）在布局网格中的格子。
+    #[serde(default)]
+    pub grid: BTreeMap<String, Cell>,
     /// 控制 Windows 时把 Cmd 和 Ctrl 对调。
     #[serde(default = "default_true")]
     pub swap_cmd_ctrl: bool,
@@ -73,12 +86,22 @@ impl Config {
             name: default_device_name(),
             peers: Vec::new(),
             trusted_hosts: Vec::new(),
-            layout: BTreeMap::new(),
+            host_names: BTreeMap::new(),
+            role: None,
+            grid: BTreeMap::new(),
             swap_cmd_ctrl: true,
             switching: SwitchSettings::default(),
             clipboard: ClipboardSettings::default(),
             update_mirror: None,
         }
+    }
+
+    pub fn role(&self) -> Role {
+        self.role.unwrap_or(if cfg!(target_os = "macos") {
+            Role::Host
+        } else {
+            Role::Client
+        })
     }
 
     pub fn peer_mut(&mut self, id: &str) -> Option<&mut Peer> {
@@ -169,9 +192,9 @@ mod tests {
         assert_eq!(k1.public(), k2.public());
 
         let mut cfg = store.load().unwrap();
-        cfg.layout.insert("a".into(), Point { x: 1.0, y: 2.0 });
+        cfg.grid.insert("a".into(), Cell { col: 1, row: 2 });
         store.save(&cfg).unwrap();
-        assert_eq!(store.load().unwrap().layout["a"], Point { x: 1.0, y: 2.0 });
+        assert_eq!(store.load().unwrap().grid["a"], Cell { col: 1, row: 2 });
         fs::remove_dir_all(dir).ok();
     }
 }
