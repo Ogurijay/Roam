@@ -1,0 +1,10 @@
+[package]
+name = "roam-proto"
+description = "Roam 线协议：消息类型与编解码"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+postcard.workspace = true
+serde.workspace = true
