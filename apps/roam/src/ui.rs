@@ -559,9 +559,7 @@ async fn revoke_host(State(app): State<App>, Path(id): Path<String>) -> ApiResul
 
 async fn copy_ticket(State(app): State<App>) -> ApiResult {
     let ticket = app.client()?.ticket.clone();
-    tokio::task::spawn_blocking(move || {
-        arboard::Clipboard::new().and_then(|mut c| c.set_text(ticket))
-    })
-    .await??;
+    tokio::task::spawn_blocking(move || crate::clipboard::with_clipboard(|c| c.set_text(ticket)))
+        .await???;
     Ok(StatusCode::NO_CONTENT)
 }

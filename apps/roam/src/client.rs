@@ -41,6 +41,8 @@ pub struct Client {
     pub host: Mutex<Option<ConnectedHost>>,
     /// 正在等待本机确认的授权请求：主机名和校验码。
     pub pending: Mutex<Option<(String, String)>>,
+    /// 每台主机当前的连接：同一台主机重连时关掉旧连接，避免两个会话同时注入、同时同步剪贴板。
+    sessions: Mutex<std::collections::HashMap<String, Connection>>,
     /// 本机注入键鼠所需的系统权限是否就绪；失败时为说明。
     pub permission: Result<(), String>,
     tray: Mutex<Option<TrayHandle>>,
@@ -84,6 +86,7 @@ impl Client {
             transfers: Transfers::default(),
             host: Mutex::new(None),
             pending: Mutex::new(None),
+            sessions: Mutex::new(std::collections::HashMap::new()),
             permission,
             tray: Mutex::new(None),
             _advertiser: advertiser,
@@ -176,8 +179,11 @@ impl Client {
                 {
                     tracing::info!("会话结束: {err:#}");
                 }
-                injector.lock().unwrap().release_all();
-                *client.host.lock().unwrap() = None;
+                // 被新连接替换掉的旧会话结束时，不要清掉新会话的状态
+                if client.sessions.lock().unwrap().is_empty() {
+                    injector.lock().unwrap().release_all();
+                    *client.host.lock().unwrap() = None;
+                }
                 client.refresh_tray();
             });
         }
@@ -270,6 +276,15 @@ impl Client {
         )
         .await?;
 
+        if let Some(old) = self
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(host_id.clone(), conn.clone())
+        {
+            tracing::info!("主机「{}」重新连接，关闭旧连接", host.name);
+            old.close(0u32.into(), b"replaced");
+        }
         tracing::info!("主机「{}」已连接", host.name);
         *self.host.lock().unwrap() = Some(ConnectedHost {
             id: host_id.clone(),
@@ -398,6 +413,15 @@ impl Client {
         dgram_task.abort();
         path_task.abort();
         side_task.abort();
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if sessions
+                .get(&host_id)
+                .is_some_and(|c| c.stable_id() == conn.stable_id())
+            {
+                sessions.remove(&host_id);
+            }
+        }
         tracing::info!("主机「{}」已断开", host.name);
         result
     }

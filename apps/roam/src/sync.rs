@@ -31,9 +31,9 @@ impl Local {
 
 /// 读取本机剪贴板：复制的是文件时优先当作文件（避免只把文件名当文本发过去）。
 fn read_local(policy: &ClipboardPolicy) -> Option<Local> {
-    let files = arboard::Clipboard::new()
+    let files = clipboard::with_clipboard(|cb| cb.get().file_list().ok())
         .ok()
-        .and_then(|mut cb| cb.get().file_list().ok())
+        .flatten()
         .filter(|list| !list.is_empty());
     match files {
         Some(paths) if policy.files => Some(Local::Files(paths)),
@@ -114,9 +114,8 @@ pub async fn receive_loop(conn: Connection, ctx: Inbound) {
             tracing::info!("文件 ← {}：{}", ctx.peer, names.join("、"));
             let on_updated = ctx.on_updated.clone();
             std::thread::spawn(move || {
-                let ok = arboard::Clipboard::new()
-                    .and_then(|mut cb| cb.set().file_list(&tops))
-                    .is_ok();
+                let ok = clipboard::with_clipboard(|cb| cb.set().file_list(&tops).is_ok())
+                    .unwrap_or(false);
                 notify_files_ready(&names, ok);
                 on_updated();
             });

@@ -233,8 +233,9 @@ fn run_with_tray(
 }
 
 fn copy_to_clipboard(text: &str) {
-    if let Err(err) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
-        dialog::alert("Roam", &format!("复制失败：{err}"));
+    let result = clipboard::with_clipboard(|c| c.set_text(text.to_string()));
+    if !matches!(result, Ok(Ok(()))) {
+        dialog::alert("Roam", "复制失败，请稍后再试");
     }
 }
 

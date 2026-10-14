@@ -10,9 +10,24 @@ use iroh::endpoint::Connection;
 use roam_proto::{ClipboardData, ClipboardPolicy, encode_side};
 use serde::de::DeserializeOwned;
 
+/// 系统剪贴板同一时间只能由一个线程访问：两个线程同时读写会损坏内存导致程序崩溃
+/// （Windows 上实际发生过：两次同步同时触发，进程以 0xc0000374 堆损坏退出）。
+/// 所有剪贴板操作都必须在这把锁里进行。
+static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 在全局剪贴板锁内打开系统剪贴板执行操作。
+pub fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Result<T> {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cb = arboard::Clipboard::new()?;
+    Ok(f(&mut cb))
+}
+
 /// 读取剪贴板。有文本时只取文本（和富文本），没有文本时才取图片。阻塞调用。
 pub fn read(policy: &ClipboardPolicy) -> Option<ClipboardData> {
-    let mut cb = arboard::Clipboard::new().ok()?;
+    with_clipboard(|cb| read_inner(cb, policy)).ok().flatten()
+}
+
+fn read_inner(cb: &mut arboard::Clipboard, policy: &ClipboardPolicy) -> Option<ClipboardData> {
     let text = cb.get_text().ok().filter(|t| !t.is_empty());
     let data = if text.is_some() {
         ClipboardData {
@@ -38,7 +53,10 @@ pub fn read(policy: &ClipboardPolicy) -> Option<ClipboardData> {
 
 /// 写入剪贴板。阻塞调用。
 pub fn write(data: &ClipboardData) -> Result<()> {
-    let mut cb = arboard::Clipboard::new()?;
+    with_clipboard(|cb| write_inner(cb, data))?
+}
+
+fn write_inner(cb: &mut arboard::Clipboard, data: &ClipboardData) -> Result<()> {
     if let Some(png) = &data.png {
         let (width, height, rgba) = decode_png(png)?;
         cb.set_image(arboard::ImageData {
@@ -120,5 +138,37 @@ mod tests {
         let (w, h, back) = decode_png(&png).unwrap();
         assert_eq!((w, h), (3, 2));
         assert_eq!(back, rgba);
+    }
+}
+
+#[cfg(test)]
+mod stress {
+    use super::*;
+
+    /// 多个线程同时读剪贴板不能崩溃（曾经因此堆损坏）。会访问真实剪贴板，只读不写，手动运行：
+    /// `cargo test -p roam concurrent_clipboard -- --ignored`
+    #[test]
+    #[ignore]
+    fn concurrent_clipboard_reads_do_not_crash() {
+        let policy = ClipboardPolicy {
+            enabled: true,
+            images: true,
+            max_bytes: 50 << 20,
+            files: true,
+            max_file_bytes: 1 << 30,
+        };
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        let _ = read(&policy);
+                        let _ = with_clipboard(|cb| cb.get().file_list().ok());
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("thread panicked");
+        }
     }
 }
