@@ -258,6 +258,10 @@ pub mod side {
     pub const FILE_OFFER: u8 = 3;
     /// 单个文件：头部是 [`FileDataHeader`](super::FileDataHeader)，之后直到流结束都是文件内容。
     pub const FILE_DATA: u8 = 4;
+    /// 对方复制了文件，但先不传：[`FileAnnounce`](super::FileAnnounce)。
+    pub const FILE_ANNOUNCE: u8 = 5;
+    /// 用户在本机按了粘贴，请对方把宣告过的文件发过来：[`FilePull`](super::FilePull)。
+    pub const FILE_PULL: u8 = 6;
 }
 
 /// 剪贴板内容。有文本时只同步文本（和富文本），没有文本时才同步图片。
@@ -324,6 +328,24 @@ pub struct FileEntry {
     pub path: String,
     pub size: u64,
     pub is_dir: bool,
+}
+
+/// 复制了文件：切屏时只告诉对方文件名和大小，对方按粘贴时再用 [`FilePull`] 来取。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileAnnounce {
+    /// 取文件时带上的凭据，只在宣告方那里有意义。
+    pub token: u64,
+    /// 文件所在设备的名字（显示用）。
+    pub from: String,
+    /// 复制时选中的顶层文件 / 文件夹名。
+    pub names: Vec<String>,
+    pub files: u32,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePull {
+    pub token: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

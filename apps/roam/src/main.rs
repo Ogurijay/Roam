@@ -20,6 +20,7 @@ mod files;
 mod host;
 mod logging;
 mod pairing;
+mod pull;
 mod sync;
 mod tray;
 mod ui;
@@ -374,6 +375,7 @@ type CaptureHandler = Box<dyn FnMut(InputEvent) -> bool + Send>;
 fn spawn_capture(host: &Arc<Host>, run: fn(CaptureHandler) -> Result<()>) {
     let router = host.router.clone();
     let capture = host.clone();
+    let paste = host.clone();
     std::thread::Builder::new()
         .name("roam-capture".into())
         .spawn(move || {
@@ -395,6 +397,12 @@ fn spawn_capture(host: &Arc<Host>, run: fn(CaptureHandler) -> Result<()>) {
                     .expect("spawn activity thread");
             }
             let result = run(Box::new(move |ev| {
+                // 本机按粘贴、而最近复制的是别的设备上的文件：先去取文件
+                if let InputEvent::Key { usage, down } = ev
+                    && paste.intercept_local_key(usage, down)
+                {
+                    return true;
+                }
                 let swallowed = router.lock().unwrap().handle(ev);
                 if swallowed {
                     active.store(true, std::sync::atomic::Ordering::Relaxed);

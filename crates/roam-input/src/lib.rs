@@ -18,6 +18,25 @@ pub fn displays() -> Vec<DisplayInfo> {
     Vec::new()
 }
 
+/// 系统剪贴板的变化计数：任何程序（包括 Roam 自己）写入剪贴板都会让它变。
+/// 用来判断"从某个时刻起，本机有没有复制过别的东西"。不支持的平台返回 None。
+pub fn clipboard_seq() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    // 可能在没有自动释放池的线程上调用（采集线程、tokio 线程）
+    return Some(objc2::rc::autoreleasepool(|_| {
+        objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() as u64
+    }));
+    #[cfg(windows)]
+    {
+        // 没有访问剪贴板的权限时返回 0
+        let seq =
+            unsafe { ::windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+        return (seq != 0).then_some(seq as u64);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 /// 本平台能否作为被控端注入输入。
 pub const CAN_INJECT: bool = cfg!(any(windows, target_os = "macos"));
 

@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -19,15 +20,18 @@ use roam_core::{
     router::{CursorControl, Outbound, PeerLink, Router},
     ticket,
 };
-use roam_proto::{ALPN, ClipboardPolicy, Datagram, DisplayInfo, Hello, Os, StreamMsg, side};
+use roam_proto::{
+    ALPN, ClipboardPolicy, Datagram, DisplayInfo, FileAnnounce, Hello, Os, StreamMsg, side,
+};
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::{
     clipboard,
     conn::{read_msg, write_msg},
     discovery::{self, Nearby},
-    files::Transfers,
+    files::{self, Transfers},
     pairing,
+    pull::{self, KeyAction, PasteKeys, Pending, Shelf, Source},
     sync::{self, Inbound, LastDigest},
     tray::{self, TrayHandle},
     update::{self, Updater},
@@ -91,6 +95,14 @@ pub struct Host {
     pub updater: Updater,
     /// 正在执行更新，防止重复点击。
     updating: Mutex<bool>,
+    /// 文件按需传：被控设备宣告的文件、主机宣告出去的文件。
+    shelf: Shelf,
+    /// 正在替另一台设备向某台设备取文件：设备 ID → 文件到了之后通知。
+    relay_waiters: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Vec<PathBuf>>>>,
+    /// 识别主机本机按的粘贴键。
+    paste_keys: Mutex<PasteKeys>,
+    /// 采集线程不在 tokio 运行时里，要通过它启动异步任务。
+    rt: tokio::runtime::Handle,
     _mdns: Option<mdns_sd::ServiceDaemon>,
     me: Mutex<std::sync::Weak<Host>>,
 }
@@ -130,6 +142,10 @@ impl Host {
             transfers: Transfers::default(),
             updater,
             updating: Mutex::new(false),
+            shelf: Shelf::default(),
+            relay_waiters: Mutex::new(HashMap::new()),
+            paste_keys: Mutex::new(PasteKeys::default()),
+            rt: tokio::runtime::Handle::current(),
             _mdns: mdns,
             me: Mutex::new(std::sync::Weak::new()),
         });
@@ -648,16 +664,40 @@ impl Host {
                 last: self.last_digest(&id),
                 transfers: self.transfers.clone(),
                 // 对方的内容进了主机剪贴板；如果光标已经去了另一台设备，顺手转发过去
-                on_updated: Arc::new(move || {
+                on_updated: {
                     let host = host.clone();
                     let id = id.clone();
-                    rt.spawn(async move {
-                        let focused = host.router.lock().unwrap().focused().map(str::to_string);
-                        if let Some(other) = focused.filter(|f| *f != id) {
-                            host.sync_clipboard_to(&other).await;
-                        }
-                    });
-                }),
+                    let rt = rt.clone();
+                    Arc::new(move || host.forward_clipboard(&rt, &id))
+                },
+                // 对方复制了文件：记下来，粘贴时再取；光标已经在别的设备上就转告过去
+                on_announce: {
+                    let host = host.clone();
+                    let id = id.clone();
+                    let rt = rt.clone();
+                    Arc::new(move |announce: FileAnnounce| {
+                        tracing::info!(
+                            "「{}」复制了 {}，粘贴时再传",
+                            announce.from,
+                            sync::describe(&announce)
+                        );
+                        host.shelf.arm(announce, Some(id.clone()));
+                        host.forward_clipboard(&rt, &id);
+                    })
+                },
+                on_pull: {
+                    let host = host.clone();
+                    let id = id.clone();
+                    let rt = rt.clone();
+                    Arc::new(move |token| {
+                        rt.spawn(host.clone().serve_pull(id.clone(), token));
+                    })
+                },
+                on_files: {
+                    let host = host.clone();
+                    let id = id.clone();
+                    Arc::new(move |tops: &[PathBuf], ok| host.files_arrived(&id, tops, ok))
+                },
             };
             tokio::spawn(sync::receive_loop(conn.clone(), ctx))
         };
@@ -845,23 +885,208 @@ impl Host {
             .clone()
     }
 
-    /// 把主机剪贴板（文本、图片或文件）发给某台设备，内容没变就跳过。
-    async fn sync_clipboard_to(&self, id: &str) {
-        let policy = self.clipboard_policy(id);
-        let Some(conn) = self.conns.lock().unwrap().get(id).cloned() else {
+    /// 被控设备的剪贴板内容到了主机：光标已经在另一台设备上时，顺手转发过去。
+    fn forward_clipboard(self: &Arc<Self>, rt: &tokio::runtime::Handle, from: &str) {
+        let host = self.clone();
+        let from = from.to_string();
+        rt.spawn(async move {
+            let focused = host.router.lock().unwrap().focused().map(str::to_string);
+            if let Some(other) = focused.filter(|f| *f != from) {
+                host.sync_clipboard_to(&other).await;
+            }
+        });
+    }
+
+    /// 主机本机的按键（在采集线程里调用）：本机按了粘贴、而最近一次复制的是别的设备上的文件时，
+    /// 拦下这次粘贴先去取文件。返回 true 表示吞掉这个按键。
+    pub fn intercept_local_key(self: &Arc<Self>, usage: u16, down: bool) -> bool {
+        let local = self.router.lock().unwrap().focused().is_none();
+        let action = self
+            .paste_keys
+            .lock()
+            .unwrap()
+            .on_key(Os::current(), usage, down, || {
+                local && self.local_pull_ready().is_some()
+            });
+        match action {
+            KeyAction::Pass => false,
+            KeyAction::Swallow => true,
+            KeyAction::Pull => {
+                if let Some(p) = self.local_pull_ready()
+                    && self.shelf.begin_pull(p.announce.token)
+                {
+                    self.rt.spawn(self.clone().pull_for_local(p));
+                }
+                true
+            }
+        }
+    }
+
+    /// 本机按粘贴时可以去取的文件：最近一次复制的是某台在线设备上的文件。
+    fn local_pull_ready(&self) -> Option<Pending> {
+        let p = self.shelf.current()?;
+        let online = p
+            .peer
+            .as_ref()
+            .is_some_and(|peer| self.conns.lock().unwrap().contains_key(peer));
+        online.then_some(p)
+    }
+
+    async fn pull_for_local(self: Arc<Self>, p: Pending) {
+        let Some(conn) = p
+            .peer
+            .as_ref()
+            .and_then(|peer| self.conns.lock().unwrap().get(peer).cloned())
+        else {
             return;
         };
-        let name = self
-            .config
+        tracing::info!(
+            "在本机按了粘贴：向「{}」取 {}",
+            p.announce.from,
+            sync::describe(&p.announce)
+        );
+        if let Err(err) = sync::request_files(&conn, p.announce.token).await {
+            tracing::warn!("请求文件失败: {err:#}");
+        }
+    }
+
+    /// 某台设备在它那边按了粘贴，来取主机宣告过的文件；文件在另一台设备上时先取过来再转发。
+    async fn serve_pull(self: Arc<Self>, to: String, token: u64) {
+        let name = self.peer_name(&to);
+        let Some(source) = self.shelf.lookup(token) else {
+            tracing::warn!("「{name}」要取的文件已经过期");
+            return;
+        };
+        let Some(conn) = self.conns.lock().unwrap().get(&to).cloned() else {
+            return;
+        };
+        let paths = match source {
+            Source::Local(paths) => paths,
+            Source::Remote { peer, token } => match self.fetch_from(&peer, token).await {
+                Ok(paths) => paths,
+                Err(err) => {
+                    tracing::warn!("为「{name}」中转文件失败: {err:#}");
+                    return;
+                }
+            },
+        };
+        let max = self.clipboard_policy(&to).max_file_bytes;
+        match files::send(&conn, paths.clone(), &name, max, &self.transfers).await {
+            // 记下来：主机剪贴板里的这些文件对方已经有了，下次切过去不用再宣告
+            Ok(()) => *self.last_digest(&to).lock().unwrap() = Some(files::digest(&paths)),
+            Err(err) => tracing::warn!("发送文件给「{name}」失败: {err:#}"),
+        }
+    }
+
+    /// 向某台设备取它宣告过的文件（中转用），返回收到后在主机上的路径。
+    async fn fetch_from(&self, peer: &str, token: u64) -> Result<Vec<PathBuf>> {
+        let conn = self
+            .conns
+            .lock()
+            .unwrap()
+            .get(peer)
+            .cloned()
+            .context("文件所在的设备不在线")?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.relay_waiters
+            .lock()
+            .unwrap()
+            .insert(peer.to_string(), tx);
+        sync::request_files(&conn, token).await?;
+        tokio::time::timeout(Duration::from_secs(30 * 60), rx)
+            .await
+            .context("等待对方发送文件超时")?
+            .context("传输中断")
+    }
+
+    /// 从某台设备收到的文件已经放进主机剪贴板（在普通线程里调用）。返回 true 表示不用再提醒用户。
+    fn files_arrived(&self, from: &str, tops: &[PathBuf], ok: bool) -> bool {
+        if let Some(tx) = self.relay_waiters.lock().unwrap().remove(from) {
+            let _ = tx.send(tops.to_vec());
+            return true;
+        }
+        let local = self.router.lock().unwrap().focused().is_none();
+        match self.shelf.pull_done() {
+            Some(true) if ok && local => {
+                tracing::info!("文件已就绪，自动粘贴");
+                let (left, right) = pull::paste_modifier(Os::current());
+                // Windows 上修饰键还按着就只按 V；macOS 的按键事件要自己带上 Cmd 标志，总是一起按
+                let held = cfg!(windows) && {
+                    let keys = self.paste_keys.lock().unwrap();
+                    keys.holds(left) || keys.holds(right)
+                };
+                let mut injector = roam_input::Injector::new();
+                if !held {
+                    injector.key(left, true);
+                }
+                injector.key(roam_core::keymap::hid::V, true);
+                injector.key(roam_core::keymap::hid::V, false);
+                if !held {
+                    injector.key(left, false);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn peer_name(&self, id: &str) -> String {
+        self.config
             .lock()
             .unwrap()
             .peers
             .iter()
             .find(|p| p.id == id)
             .map(|p| p.name.clone())
-            .unwrap_or_else(|| short_id(id).to_string());
+            .unwrap_or_else(|| short_id(id).to_string())
+    }
+
+    /// 把主机剪贴板发给某台设备：文本、图片直接发，文件只宣告。内容没变就跳过。
+    async fn sync_clipboard_to(&self, id: &str) {
+        let policy = self.clipboard_policy(id);
+        let Some(conn) = self.conns.lock().unwrap().get(id).cloned() else {
+            return;
+        };
+        let name = self.peer_name(id);
         let last = self.last_digest(id);
-        if let Err(err) = sync::push(&conn, policy, &last, &name, &self.transfers).await {
+
+        // 最近一次复制的是某台设备上的文件（主机剪贴板之后没变过）：转告给这台设备，
+        // 由主机中转；光标回到了文件所在的设备就什么都不用做
+        if let Some(p) = self.shelf.current() {
+            let Some(source) = p.peer.clone() else { return };
+            if source == id || !policy.enabled || !policy.files {
+                return;
+            }
+            let digest = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                ("relay", &source, p.announce.token).hash(&mut h);
+                h.finish()
+            };
+            {
+                let mut last = last.lock().unwrap();
+                if *last == Some(digest) {
+                    return;
+                }
+                *last = Some(digest);
+            }
+            let token = self.shelf.register(Source::Remote {
+                peer: source,
+                token: p.announce.token,
+            });
+            let announce = FileAnnounce {
+                token,
+                ..p.announce
+            };
+            if let Err(err) = sync::send_announce(&conn, &announce, &name).await {
+                *last.lock().unwrap() = None;
+                tracing::warn!("同步到「{name}」失败: {err:#}");
+            }
+            return;
+        }
+
+        let me = self.config.lock().unwrap().name.clone();
+        if let Err(err) = sync::push(&conn, policy, &last, &name, &me, &self.shelf).await {
             tracing::warn!("同步到「{name}」失败: {err:#}");
         }
     }

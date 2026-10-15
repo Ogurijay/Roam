@@ -20,8 +20,9 @@ use serde::Serialize;
 use crate::{
     conn::{self, read_msg, write_msg},
     dialog, discovery,
-    files::{Transfers, human_bytes},
+    files::{self, Transfers, human_bytes},
     pairing,
+    pull::{self, KeyAction, PasteKeys, Shelf, Source},
     sync::{self, Inbound, LastDigest},
     tray::{self, TrayHandle},
 };
@@ -280,6 +281,7 @@ impl Client {
             return Ok(());
         }
         let name = self.store.load()?.name;
+        let me = name.clone();
         write_msg(
             &mut send,
             &StreamMsg::Hello(Hello {
@@ -398,6 +400,8 @@ impl Client {
         // 老版本主机不会下发策略，默认不同步。
         let policy = Arc::new(Mutex::new(ClipboardPolicy::default()));
         let last = LastDigest::default();
+        // 文件按需传：主机宣告的文件在本机按粘贴时去取；本机宣告的文件等主机来取
+        let shelf = Arc::new(Shelf::default());
         let side_task = {
             let ctx = Inbound {
                 peer: host.name.clone(),
@@ -412,6 +416,64 @@ impl Client {
                 last: last.clone(),
                 transfers: self.transfers.clone(),
                 on_updated: Arc::new(|| {}),
+                on_announce: {
+                    let shelf = shelf.clone();
+                    let policy = policy.clone();
+                    Arc::new(move |announce| {
+                        let max = policy.lock().unwrap().max_file_bytes;
+                        if announce.total > max {
+                            tracing::info!(
+                                "「{}」复制了 {}，超过文件大小上限 {}，不会传过来",
+                                announce.from,
+                                sync::describe(&announce),
+                                human_bytes(max)
+                            );
+                            return;
+                        }
+                        tracing::info!(
+                            "「{}」复制了 {}，在本机粘贴时传过来",
+                            announce.from,
+                            sync::describe(&announce)
+                        );
+                        shelf.arm(announce, None);
+                    })
+                },
+                on_pull: {
+                    let shelf = shelf.clone();
+                    let conn = conn.clone();
+                    let policy = policy.clone();
+                    let transfers = self.transfers.clone();
+                    let host_name = host.name.clone();
+                    Arc::new(move |token| {
+                        let Some(Source::Local(paths)) = shelf.lookup(token) else {
+                            tracing::warn!("主机要取的文件已经过期");
+                            return;
+                        };
+                        let conn = conn.clone();
+                        let max = policy.lock().unwrap().max_file_bytes;
+                        let transfers = transfers.clone();
+                        let host_name = host_name.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) =
+                                files::send(&conn, paths, &host_name, max, &transfers).await
+                            {
+                                tracing::warn!("发送文件失败: {err:#}");
+                            }
+                        });
+                    })
+                },
+                on_files: {
+                    let shelf = shelf.clone();
+                    let injector = injector.clone();
+                    Arc::new(move |_tops, ok| match shelf.pull_done() {
+                        Some(true) if ok => {
+                            tracing::info!("文件已就绪，自动粘贴");
+                            injector.lock().unwrap().paste();
+                            true
+                        }
+                        _ => false,
+                    })
+                },
             };
             tokio::spawn(sync::receive_loop(conn.clone(), ctx))
         };
@@ -447,6 +509,7 @@ impl Client {
             })
         };
 
+        let mut keys = PasteKeys::default();
         let result = async {
             loop {
                 let msg = read_msg(&mut recv).await?;
@@ -458,14 +521,16 @@ impl Client {
                     _ => None,
                 };
                 if matches!(msg, StreamMsg::Leave) {
+                    shelf.cancel_auto_paste();
                     let conn = conn.clone();
                     let policy = *policy.lock().unwrap();
                     let last = last.clone();
-                    let transfers = self.transfers.clone();
                     let host_name = host.name.clone();
+                    let me = me.clone();
+                    let shelf = shelf.clone();
                     tokio::spawn(async move {
                         if let Err(err) =
-                            sync::push(&conn, policy, &last, &host_name, &transfers).await
+                            sync::push(&conn, policy, &last, &host_name, &me, &shelf).await
                         {
                             tracing::warn!("同步到主机失败: {err:#}");
                         }
@@ -477,12 +542,45 @@ impl Client {
                         StreamMsg::Enter { x, y } | StreamMsg::MouseTo { x, y } => {
                             inj.move_to(x, y)
                         }
-                        StreamMsg::Leave | StreamMsg::ReleaseAll => inj.release_all(),
-                        StreamMsg::Key { usage, down } => inj.key(usage, down),
+                        StreamMsg::Leave | StreamMsg::ReleaseAll => {
+                            keys.reset();
+                            inj.release_all()
+                        }
+                        StreamMsg::Key { usage, down } => {
+                            // 主机那边复制了文件、本机之后没复制过别的：拦下粘贴，先去取文件
+                            let action = keys
+                                .on_key(Os::current(), usage, down, || shelf.current().is_some());
+                            match action {
+                                KeyAction::Pass => inj.key(usage, down),
+                                KeyAction::Swallow => {}
+                                KeyAction::Pull => {
+                                    if let Some(p) = shelf.current()
+                                        && shelf.begin_pull(p.announce.token)
+                                    {
+                                        tracing::info!(
+                                            "在本机按了粘贴：向「{}」取 {}",
+                                            p.announce.from,
+                                            sync::describe(&p.announce)
+                                        );
+                                        let conn = conn.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(err) =
+                                                sync::request_files(&conn, p.announce.token).await
+                                            {
+                                                tracing::warn!("请求文件失败: {err:#}");
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         StreamMsg::Button { button, down } => inj.button(button, down),
                         StreamMsg::WheelLines { dx, dy } => inj.wheel_lines(dx, dy),
                         StreamMsg::WheelPixels { dx, dy } => inj.wheel_pixels(dx, dy),
-                        StreamMsg::KeyState { pressed } => inj.sync_keys(&pressed),
+                        StreamMsg::KeyState { pressed } => {
+                            keys.sync(&pressed);
+                            inj.sync_keys(&pressed)
+                        }
                         StreamMsg::LockScreen => {
                             tracing::info!("主机「{}」请求锁定本机", host.name);
                             inj.lock_screen()
@@ -529,6 +627,8 @@ fn check_permission() -> Result<(), String> {
 struct Sink {
     local: Injector,
     last_seq: Option<u32>,
+    /// 按着的键（替用户粘贴时要知道修饰键是不是已经按着）。
+    held: std::collections::HashSet<u16>,
     #[cfg(windows)]
     helper: crate::winsvc::HelperLink,
     #[cfg(windows)]
@@ -542,6 +642,7 @@ impl Sink {
         Self {
             local: Injector::new(),
             last_seq: None,
+            held: Default::default(),
             #[cfg(windows)]
             helper: crate::winsvc::HelperLink::new(),
             #[cfg(windows)]
@@ -592,6 +693,11 @@ impl Sink {
     }
 
     fn key(&mut self, usage: u16, down: bool) {
+        if down {
+            self.held.insert(usage);
+        } else {
+            self.held.remove(&usage);
+        }
         if !self.via_helper(helper_msg!(Key { usage, down })) {
             self.local.key(usage, down);
         }
@@ -616,10 +722,26 @@ impl Sink {
     }
 
     fn sync_keys(&mut self, pressed: &[u16]) {
+        self.held.retain(|k| pressed.contains(k));
         self.local.sync_keys(pressed);
     }
 
+    /// 替用户按一次粘贴（取来的文件放进剪贴板之后）。修饰键已经按着就只按 V。
+    fn paste(&mut self) {
+        let (left, right) = pull::paste_modifier(Os::current());
+        let held = self.held.contains(&left) || self.held.contains(&right);
+        if !held {
+            self.key(left, true);
+        }
+        self.key(roam_core::keymap::hid::V, true);
+        self.key(roam_core::keymap::hid::V, false);
+        if !held {
+            self.key(left, false);
+        }
+    }
+
     fn release_all(&mut self) {
+        self.held.clear();
         self.local.release_all();
         #[cfg(windows)]
         {

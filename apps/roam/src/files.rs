@@ -139,7 +139,7 @@ pub fn digest(paths: &[PathBuf]) -> u64 {
     h.finish()
 }
 
-fn new_id() -> u64 {
+pub(crate) fn new_id() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -149,6 +149,18 @@ fn new_id() -> u64 {
 }
 
 // ---------------------------------------------------------------- 发送
+
+/// 宣告用的概况：顶层名字、文件数、总大小。会遍历文件夹，阻塞调用。
+pub fn summarize(paths: &[PathBuf]) -> Result<(Vec<String>, u32, u64)> {
+    let (entries, _) = collect(paths)?;
+    let names = paths
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    let files = entries.iter().filter(|e| !e.is_dir).count() as u32;
+    let total = entries.iter().map(|e| e.size).sum();
+    Ok((names, files, total))
+}
 
 /// 把选中的文件和文件夹展开成清单，同时记下每个条目的源路径。
 fn collect(paths: &[PathBuf]) -> Result<(Vec<FileEntry>, Vec<PathBuf>)> {

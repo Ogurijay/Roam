@@ -6,6 +6,7 @@
 use roam_proto::Os;
 
 pub mod hid {
+    pub const V: u16 = 0x19;
     pub const ESCAPE: u16 = 0x29;
     pub const CAPS_LOCK: u16 = 0x39;
     pub const LEFT_CTRL: u16 = 0xE0;

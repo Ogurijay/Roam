@@ -1,4 +1,6 @@
-//! 切屏时的剪贴板与文件同步，主机和被控端共用。
+//! 切屏时的剪贴板同步，主机和被控端共用。
+//!
+//! 文本和图片直接发过去；文件只宣告，对方按粘贴时再传（见 [`crate::pull`]）。
 
 use std::{
     path::PathBuf,
@@ -7,11 +9,14 @@ use std::{
 
 use anyhow::Result;
 use iroh::endpoint::Connection;
-use roam_proto::{ClipboardData, ClipboardPolicy, FileDataHeader, FileOffer, side};
+use roam_proto::{
+    ClipboardData, ClipboardPolicy, FileAnnounce, FileDataHeader, FileOffer, FilePull, side,
+};
 
 use crate::{
     clipboard,
-    files::{self, Receiver, Transfers},
+    files::{self, Receiver, Transfers, human_bytes},
+    pull::{Shelf, Source},
 };
 
 /// 本机剪贴板里的内容。
@@ -45,15 +50,20 @@ fn read_local(policy: &ClipboardPolicy) -> Option<Local> {
 /// 最近一次同步（收到或发出）的内容摘要，没变就不重复发送。
 pub type LastDigest = Arc<Mutex<Option<u64>>>;
 
-/// 把本机剪贴板发给对方。文件传输可能很久，调用方应放到单独的任务里。
+/// 把本机剪贴板发给对方：文本和图片直接发，文件只宣告。`peer` 是对方的名字，`me` 是本机的。
 pub async fn push(
     conn: &Connection,
     policy: ClipboardPolicy,
     last: &LastDigest,
     peer: &str,
-    transfers: &Transfers,
+    me: &str,
+    shelf: &Shelf,
 ) -> Result<()> {
     if !policy.enabled {
+        return Ok(());
+    }
+    // 收到别处的文件宣告后本机没复制过别的：最近一次复制在别处，本机剪贴板里是旧内容，不能发
+    if shelf.current().is_some() {
         return Ok(());
     }
     let Some(local) = tokio::task::spawn_blocking(move || read_local(&policy)).await? else {
@@ -75,20 +85,63 @@ pub async fn push(
             tracing::info!("剪贴板 → {peer}（{size} 字节）");
         }
         Local::Files(paths) => {
-            let count = paths.len();
-            if let Err(err) = files::send(conn, paths, peer, policy.max_file_bytes, transfers).await
-            {
-                // 网络问题允许下次切屏时重试；文件读不了就别每次都试，等剪贴板换了内容
-                if !err.is::<files::Unreadable>() {
+            let summary = {
+                let paths = paths.clone();
+                tokio::task::spawn_blocking(move || files::summarize(&paths)).await?
+            };
+            let (names, files, total) = match summary {
+                Ok(s) => s,
+                Err(err) => {
                     *last.lock().unwrap() = None;
+                    return Err(err);
                 }
+            };
+            let token = shelf.register(Source::Local(paths));
+            let announce = FileAnnounce {
+                token,
+                from: me.to_string(),
+                names,
+                files,
+                total,
+            };
+            if let Err(err) = send_announce(conn, &announce, peer).await {
+                *last.lock().unwrap() = None;
                 return Err(err);
             }
-            tracing::info!("文件 → {peer}（{count} 项）");
         }
     }
     Ok(())
 }
+
+/// 宣告复制了文件（不传内容）。
+pub async fn send_announce(conn: &Connection, announce: &FileAnnounce, peer: &str) -> Result<()> {
+    clipboard::send_side(conn, side::FILE_ANNOUNCE, announce).await?;
+    tracing::info!(
+        "文件 → {peer}：{}（{} 个文件，{}），对方粘贴时再传",
+        announce.names.join("、"),
+        announce.files,
+        human_bytes(announce.total)
+    );
+    Ok(())
+}
+
+/// 用户在本机按了粘贴：请对方把宣告过的文件发过来。
+pub async fn request_files(conn: &Connection, token: u64) -> Result<()> {
+    clipboard::send_side(conn, side::FILE_PULL, &FilePull { token }).await
+}
+
+/// 文件宣告的一句话说明（日志用）。
+pub fn describe(announce: &FileAnnounce) -> String {
+    format!(
+        "{}（{} 个文件，{}）",
+        announce.names.join("、"),
+        announce.files,
+        human_bytes(announce.total)
+    )
+}
+
+/// 收到的文件放进剪贴板之后的回调，见 [`Inbound::on_files`]。
+pub type OnFiles = Arc<dyn Fn(&[PathBuf], bool) -> bool + Send + Sync>;
 
 /// 接收对方发来的单向流的上下文。
 pub struct Inbound {
@@ -99,8 +152,15 @@ pub struct Inbound {
     pub on_policy: Option<Arc<dyn Fn(ClipboardPolicy) + Send + Sync>>,
     pub last: LastDigest,
     pub transfers: Transfers,
-    /// 剪贴板被对方内容更新后调用（主机用来转发给当前所在的另一台设备）。
+    /// 剪贴板被对方的文本 / 图片更新后调用（主机用来转发给当前所在的另一台设备）。
     pub on_updated: Arc<dyn Fn() + Send + Sync>,
+    /// 对方宣告复制了文件。
+    pub on_announce: Arc<dyn Fn(FileAnnounce) + Send + Sync>,
+    /// 对方来取本机宣告过的文件。
+    pub on_pull: Arc<dyn Fn(u64) + Send + Sync>,
+    /// 收到的文件已经放进剪贴板（参数表示是否成功放进去）。返回 true 表示已经处理
+    /// （例如自动粘贴了），不用再提醒用户。在普通线程里调用。
+    pub on_files: OnFiles,
 }
 
 pub async fn receive_loop(conn: Connection, ctx: Inbound) {
@@ -114,12 +174,13 @@ pub async fn receive_loop(conn: Connection, ctx: Inbound) {
                 .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .collect();
             tracing::info!("文件 ← {}：{}", ctx.peer, names.join("、"));
-            let on_updated = ctx.on_updated.clone();
+            let on_files = ctx.on_files.clone();
             std::thread::spawn(move || {
                 let ok = clipboard::with_clipboard(|cb| cb.set().file_list(&tops).is_ok())
                     .unwrap_or(false);
-                notify_files_ready(&names, ok);
-                on_updated();
+                if !on_files(&tops, ok) {
+                    notify_files_ready(&names, ok);
+                }
             });
         })
     };
@@ -160,6 +221,16 @@ pub async fn receive_loop(conn: Connection, ctx: Inbound) {
                 };
                 if let Err(err) = receiver.on_offer(offer, &ctx.peer, policy.max_file_bytes) {
                     tracing::warn!("拒收文件: {err:#}");
+                }
+            }
+            side::FILE_ANNOUNCE if policy.enabled && policy.files => {
+                if let Ok(announce) = clipboard::decode::<FileAnnounce>(&body) {
+                    (ctx.on_announce)(announce);
+                }
+            }
+            side::FILE_PULL => {
+                if let Ok(pull) = clipboard::decode::<FilePull>(&body) {
+                    (ctx.on_pull)(pull.token);
                 }
             }
             side::FILE_DATA => {
