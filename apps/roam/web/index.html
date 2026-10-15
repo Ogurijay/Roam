@@ -577,8 +577,8 @@ function renderGrid() {
     if (hit) {
       const [d, i] = hit;
       const disabled = d.settings && !d.settings.enabled;
-      const live = d.online && !disabled;
-      const status = d.is_host ? '本机' : d.pending_code ? '待确认' : disabled ? '已停用' : d.online ? (d.path || '在线') : '离线';
+      const live = d.online && !disabled && !d.stalled;
+      const status = d.is_host ? '本机' : d.pending_code ? '待确认' : disabled ? '已停用' : d.stalled ? '无响应' : d.online ? (d.path || '在线') : '离线';
       const n = deviceNumber(d);
       const multi = d.displays.length > 1;
       const disp = d.displays[i];
@@ -693,14 +693,17 @@ function renderDetail() {
   $('edScrollVal').textContent = `${s.scroll_speed.toFixed(2)}×`;
 
   const verOld = d.online && d.version && d.version !== state.version;
-  const status = d.online ? `<span style="color:var(--ok)">在线</span> · ${esc(d.path || '')} ${rttText(d.rtt_ms)}`
+  const status = d.stalled ? `<span class="pending">暂时没有响应</span> · ${esc(d.path || '')}`
+    : d.online ? `<span style="color:var(--ok)">在线</span> · ${esc(d.path || '')} ${rttText(d.rtt_ms)}`
     : d.pending_code ? `<span class="pending">等待对方确认 · 校验码 ${esc(d.pending_code)}</span>`
     : d.denied ? '已被拒绝' : d.displays.length ? '离线' : '正在连接…';
   setHtml($('edInfo'), `<div class="kv">
       <span class="k">状态</span><span>${status}</span>
       <span class="k">系统</span><span>${esc(OS[d.os] || '未知')}${d.displays.length ? ' · ' + screens(d) : ''}</span>
       <span class="k">版本</span><span>${d.version ? 'v' + esc(d.version) : '—'} ${verOld ? `<button class="link small" data-syncver="${d.id}">同步到 v${esc(state.version)}</button>` : ''}</span>
+      ${d.online && d.drops ? `<span class="k">网络</span><span>本次连接中断过 ${d.drops} 次，最长 ${(d.longest_drop_ms / 1000).toFixed(1)} 秒</span>` : ''}
     </div>
+    ${d.stalled ? `<div class="err">超过 3 秒没有收到它的回应，光标已收回本机，恢复后可以继续切过去。</div>` : ''}
     ${!d.online && d.error ? `<div class="err">${esc(d.error)}</div>` : ''}
     ${!d.online && (d.denied || d.error) ? `<button class="small" data-retry="${d.id}" style="margin-top:6px">重新连接</button>` : ''}`);
 }

@@ -73,6 +73,32 @@ pub fn selected_path(conn: &Connection) -> Option<(PathKind, String, std::time::
     })
 }
 
+/// 所有路径的概况，写日志排查用。选中的路径前面带 `*`。
+pub fn describe_paths(conn: &Connection) -> String {
+    let paths = conn.paths();
+    if paths.is_empty() {
+        return "没有可用路径".into();
+    }
+    paths
+        .iter()
+        .map(|p| {
+            let addr = match p.remote_addr() {
+                TransportAddr::Ip(sa) => sa.to_string(),
+                other => format!("{other:?}"),
+            };
+            let stats = p.stats();
+            format!(
+                "{}{} {addr} · {:.0} ms · 累计丢包 {}",
+                if p.is_selected() { "*" } else { "" },
+                classify(p.remote_addr()).label(),
+                stats.rtt.as_secs_f64() * 1000.0,
+                stats.lost_packets,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

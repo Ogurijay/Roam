@@ -2,12 +2,17 @@
 
 use std::{
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, bail};
 use iroh::endpoint::Connection;
-use roam_core::{config::Store, net::selected_path, ticket};
+use roam_core::{
+    config::Store,
+    health::{DOWN_AFTER, HEARTBEAT, LinkEvent, LinkHealth, STALL_AFTER, TIMER_LATE},
+    net::{describe_paths, selected_path},
+    ticket,
+};
 use roam_input::Injector;
 use roam_proto::{ClipboardPolicy, Datagram, Hello, Os, StreamMsg};
 use serde::Serialize;
@@ -30,6 +35,11 @@ pub struct ConnectedHost {
     pub version: String,
     pub path: Option<&'static str>,
     pub rtt_ms: Option<f64>,
+    /// 超过几秒没收到主机的数据。
+    pub stalled: bool,
+    /// 本次连接里网络中断的次数和最长一次（毫秒）。
+    pub drops: u32,
+    pub longest_drop_ms: u64,
 }
 
 /// 被控端的运行状态，界面和托盘共用。
@@ -116,6 +126,7 @@ impl Client {
             format!("{arrow}「{}」{pct}%（{}）", t.title, human_bytes(t.total))
         });
         match (self.host.lock().unwrap().clone(), transfer) {
+            (Some(h), _) if h.stalled => format!("主机「{}」暂时没有响应", h.name),
             (Some(h), Some(t)) => format!("已被「{}」控制 · {t}", h.name),
             (Some(h), None) => match (h.path, h.rtt_ms) {
                 (Some(path), Some(rtt)) => format!("已被「{}」控制 · {path} · {rtt:.1} ms", h.name),
@@ -153,7 +164,12 @@ impl Client {
                 let conn = match incoming.await {
                     Ok(conn) => conn,
                     Err(err) => {
-                        tracing::warn!("连接握手失败: {err:#}");
+                        // 首包解密失败：通常是公网扫描器碰到了路由器映射出去的端口，不是真正的主机
+                        if err.to_string().contains("authentication failed") {
+                            tracing::debug!("忽略无法解密的连接请求: {err:#}");
+                        } else {
+                            tracing::warn!("连接握手失败: {err:#}");
+                        }
                         return;
                     }
                 };
@@ -293,29 +309,87 @@ impl Client {
             version: host.version.clone(),
             path: None,
             rtt_ms: None,
+            stalled: false,
+            drops: 0,
+            longest_drop_ms: 0,
         });
         self.refresh_tray();
         injector.lock().unwrap().reset_sequence();
+        // 主机定期发心跳（老版本主机不发，那就不做判断）
+        let health = Arc::new(Mutex::new(LinkHealth::default()));
 
         // 连接刚建立时通常先走中继，打洞成功后切到直连；定期刷新状态
         let path_task = {
             let client = self.clone();
             let conn = conn.clone();
+            let health = health.clone();
             tokio::spawn(async move {
                 let mut last = None;
                 loop {
                     if let Some((kind, addr, rtt)) = selected_path(&conn) {
                         if last != Some(kind) {
-                            tracing::info!("连接路径：{} {addr}", kind.label());
+                            tracing::info!(
+                                "连接路径：{} {addr}（{}）",
+                                kind.label(),
+                                describe_paths(&conn)
+                            );
                             last = Some(kind);
                         }
+                        let health = health.lock().unwrap().clone();
                         if let Some(h) = &mut *client.host.lock().unwrap() {
                             h.path = Some(kind.label());
                             h.rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
+                            h.stalled = health.stalled();
+                            h.drops = health.drops;
+                            h.longest_drop_ms = health.longest.as_millis() as u64;
                         }
                         client.refresh_tray();
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            })
+        };
+
+        // 检查主机的心跳：长时间收不到就松开所有按键，免得卡键；中断情况写进日志
+        let watch_task = {
+            let conn = conn.clone();
+            let health = health.clone();
+            let injector = injector.clone();
+            let name = host.name.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(HEARTBEAT);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut late_logged: Option<Instant> = None;
+                loop {
+                    let scheduled = tick.tick().await.into_std();
+                    let now = Instant::now();
+                    let late = now.saturating_duration_since(scheduled);
+                    if late >= TIMER_LATE
+                        && late_logged.is_none_or(|t| now - t > Duration::from_secs(60))
+                    {
+                        tracing::warn!(
+                            "心跳定时器晚了 {:.1} 秒：本机 Roam 被系统节流（App Nap / 节能模式）或者卡住了",
+                            late.as_secs_f64()
+                        );
+                        late_logged = Some(now);
+                    }
+                    let event = health.lock().unwrap().check(now);
+                    match event {
+                        Some(LinkEvent::Down) => tracing::warn!(
+                            "{:.0} 秒没有收到主机「{name}」的数据（{}）",
+                            DOWN_AFTER.as_secs_f64(),
+                            describe_paths(&conn)
+                        ),
+                        Some(LinkEvent::Stalled) => {
+                            tracing::warn!(
+                                "超过 {} 秒没有收到主机「{name}」的数据，松开所有按键（{}）",
+                                STALL_AFTER.as_secs(),
+                                describe_paths(&conn)
+                            );
+                            injector.lock().unwrap().release_all();
+                        }
+                        None => {}
+                    }
                 }
             })
         };
@@ -346,8 +420,18 @@ impl Client {
         let dgram_task = {
             let conn = conn.clone();
             let injector = injector.clone();
+            let health = health.clone();
+            let name = host.name.clone();
             tokio::spawn(async move {
                 while let Ok(bytes) = conn.read_datagram().await {
+                    let outage = health.lock().unwrap().heard(Instant::now());
+                    if let Some(outage) = outage {
+                        tracing::info!(
+                            "恢复收到主机「{name}」的数据，中断了 {:.1} 秒（{}）",
+                            outage.as_secs_f64(),
+                            describe_paths(&conn)
+                        );
+                    }
                     match Datagram::decode(&bytes) {
                         Ok(Datagram::MouseAbs { seq, x, y }) => {
                             injector.lock().unwrap().mouse_abs(seq, x, y)
@@ -415,6 +499,7 @@ impl Client {
         .await;
 
         dgram_task.abort();
+        watch_task.abort();
         path_task.abort();
         side_task.abort();
         {

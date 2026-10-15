@@ -3930,6 +3930,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-graphics",
  "libc",
+ "objc2-foundation",
  "roam-core",
  "roam-proto",
  "tracing",

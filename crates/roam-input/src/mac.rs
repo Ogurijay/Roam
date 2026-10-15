@@ -193,6 +193,10 @@ static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 ///
 /// `handler` 对每个输入事件返回 `true` 表示吞掉（不交给 macOS）。
 pub fn run_capture(handler: impl FnMut(InputEvent) -> bool + Send + 'static) -> Result<()> {
+    // 回调太慢会被系统暂停 tap（整个系统的键鼠都会跟着卡一下），采集线程用最高的 QoS
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
     let handler = Mutex::new(handler);
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -219,6 +223,7 @@ pub fn run_capture(handler: impl FnMut(InputEvent) -> bool + Send + 'static) -> 
                 etype,
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
+                tracing::warn!("事件 tap 被系统暂停（{etype:?}），已重新启用");
                 let port = TAP_PORT.load(Ordering::Acquire);
                 if !port.is_null() {
                     unsafe { CGEventTapEnable(port as CFMachPortRef, true) };

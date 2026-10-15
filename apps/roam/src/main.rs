@@ -141,6 +141,8 @@ fn main() -> Result<()> {
         Some(Cmd::Service { .. } | Cmd::InputHelper { .. }) => unreachable!("handled above"),
         None => (store.load()?.role(), false),
     };
+    // 常驻后台也要保持实时响应（关闭 App Nap / 后台节能）
+    roam_input::power::keep_responsive();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -376,7 +378,29 @@ fn spawn_capture(host: &Arc<Host>, run: fn(CaptureHandler) -> Result<()>) {
         .name("roam-capture".into())
         .spawn(move || {
             *capture.capture.lock().unwrap() = Ok(());
-            let result = run(Box::new(move |ev| router.lock().unwrap().handle(ev)));
+            // 光标在别的电脑上时本机键鼠事件都被拦下，定期告诉系统用户仍在操作，免得本机息屏、睡眠
+            let active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let active = active.clone();
+                std::thread::Builder::new()
+                    .name("roam-activity".into())
+                    .spawn(move || {
+                        loop {
+                            std::thread::sleep(Duration::from_secs(5));
+                            if active.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                                roam_input::power::declare_user_active();
+                            }
+                        }
+                    })
+                    .expect("spawn activity thread");
+            }
+            let result = run(Box::new(move |ev| {
+                let swallowed = router.lock().unwrap().handle(ev);
+                if swallowed {
+                    active.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                swallowed
+            }));
             if let Err(err) = result {
                 tracing::error!("键鼠采集失败: {err:#}");
                 *capture.capture.lock().unwrap() = Err(format!("{err:#}"));

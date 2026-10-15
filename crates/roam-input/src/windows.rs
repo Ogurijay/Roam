@@ -566,6 +566,13 @@ pub fn run_capture(handler: impl FnMut(InputEvent) -> bool + Send + 'static) -> 
     );
     *MONITORS.lock().unwrap() = monitors();
     *HANDLER.lock().unwrap() = Some(Box::new(handler));
+    // 低级钩子处理太慢会被系统悄悄摘掉，钩子线程用最高优先级
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    }
     let module = unsafe { GetModuleHandleW(std::ptr::null()) };
     let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), module, 0) };
     let keyboard = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) };

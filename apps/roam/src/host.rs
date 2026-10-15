@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -13,12 +13,13 @@ use iroh::{
 };
 use roam_core::{
     config::{Config, Peer, Store},
+    health::{DOWN_AFTER, HEARTBEAT, LinkEvent, LinkHealth, STALL_AFTER, TIMER_LATE},
     layout::{Cell, DeviceGeom, HOST_CELL, World, default_cells, grid_key, nearest_free},
-    net::{PathKind, selected_path},
+    net::{PathKind, describe_paths, selected_path},
     router::{CursorControl, Outbound, PeerLink, Router},
     ticket,
 };
-use roam_proto::{ALPN, ClipboardPolicy, DisplayInfo, Hello, Os, StreamMsg, side};
+use roam_proto::{ALPN, ClipboardPolicy, Datagram, DisplayInfo, Hello, Os, StreamMsg, side};
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::{
@@ -60,6 +61,11 @@ pub struct PeerStatus {
     pub denied: bool,
     /// 对方的程序版本。
     pub version: Option<String>,
+    /// 连着但超过几秒没有响应：暂时不让光标切过去。
+    pub stalled: bool,
+    /// 本次连接里网络中断过几次、最长一次多久（毫秒）。
+    pub drops: u32,
+    pub longest_drop_ms: u64,
 }
 
 pub struct Host {
@@ -366,7 +372,7 @@ impl Host {
         for p in &config.peers {
             if p.settings.enabled
                 && !p.displays.is_empty()
-                && status.get(&p.id).is_some_and(|s| s.online)
+                && status.get(&p.id).is_some_and(|s| s.online && !s.stalled)
             {
                 let rects: Vec<roam_proto::Rect> = p.displays.iter().map(|d| d.rect).collect();
                 world_devices.push(geom(&p.id, &rects));
@@ -610,7 +616,8 @@ impl Host {
             .lock()
             .unwrap()
             .add_peer(peer.id.clone(), PeerLink { os: hello.os, tx });
-        self.update_status(&peer.id, &conn, &hello.version);
+        let health = Arc::new(Mutex::new(LinkHealth::default()));
+        self.update_status(&peer.id, &conn, &hello.version, &health);
         self.rebuild_world();
         tracing::info!("已连接 {}", hello.name);
 
@@ -657,6 +664,16 @@ impl Host {
 
         // 被控端只会回 Pong，后台读掉即可
         let reader = tokio::spawn(async move { while read_msg(&mut recv).await.is_ok() {} });
+        // 心跳单独一个任务：网络卡住时下面的循环会阻塞在写流上，不能靠它来发现问题
+        let heartbeat = {
+            let host = self.this();
+            let id = peer.id.clone();
+            let name = hello.name.clone();
+            let version = hello.version.clone();
+            let conn = conn.clone();
+            let health = health.clone();
+            tokio::spawn(async move { host.heartbeat(id, name, version, conn, health).await })
+        };
         let mut status_tick = tokio::time::interval(Duration::from_secs(1));
         let result = loop {
             tokio::select! {
@@ -673,14 +690,106 @@ impl Host {
                         }
                     }
                 }
-                _ = status_tick.tick() => self.update_status(&peer.id, &conn, &hello.version),
+                _ = status_tick.tick() => self.update_status(&peer.id, &conn, &hello.version, &health),
                 reason = conn.closed() => break Err(anyhow::anyhow!("连接断开: {reason}")),
             }
         };
         reader.abort();
+        heartbeat.abort();
         side_task.abort();
         self.conns.lock().unwrap().remove(&peer.id);
         result
+    }
+
+    /// 定期给被控端发心跳并读回复。对方超过 [`STALL_AFTER`] 没有响应时把光标收回本机，
+    /// 并且暂时不让光标切过去，恢复后自动放开。中断情况都写进日志。
+    async fn heartbeat(
+        self: Arc<Self>,
+        id: String,
+        name: String,
+        version: String,
+        conn: Connection,
+        health: Arc<Mutex<LinkHealth>>,
+    ) {
+        let pongs = {
+            let host = self.clone();
+            let (id, name, version) = (id.clone(), name.clone(), version.clone());
+            let conn = conn.clone();
+            let health = health.clone();
+            tokio::spawn(async move {
+                while let Ok(bytes) = conn.read_datagram().await {
+                    if !matches!(Datagram::decode(&bytes), Ok(Datagram::Pong { .. })) {
+                        continue;
+                    }
+                    let (outage, was_stalled) = {
+                        let mut h = health.lock().unwrap();
+                        let was_stalled = h.stalled();
+                        (h.heard(Instant::now()), was_stalled)
+                    };
+                    let Some(outage) = outage else { continue };
+                    tracing::info!(
+                        "「{name}」恢复响应，中断了 {:.1} 秒（{}）",
+                        outage.as_secs_f64(),
+                        describe_paths(&conn)
+                    );
+                    if was_stalled {
+                        host.update_status(&id, &conn, &version, &health);
+                        host.rebuild_world();
+                    }
+                }
+            })
+        };
+        let _pongs = AbortOnDrop(pongs.abort_handle());
+
+        let mut tick = tokio::time::interval(HEARTBEAT);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut seq = 0u64;
+        let mut late_logged: Option<Instant> = None;
+        loop {
+            let scheduled = tick.tick().await.into_std();
+            let now = Instant::now();
+            let late = now.saturating_duration_since(scheduled);
+            if late >= TIMER_LATE && late_logged.is_none_or(|t| now - t > Duration::from_secs(60)) {
+                tracing::warn!(
+                    "心跳定时器晚了 {:.1} 秒：本机 Roam 被系统节流（App Nap / 节能模式）或者卡住了",
+                    late.as_secs_f64()
+                );
+                late_logged = Some(now);
+            }
+            seq = seq.wrapping_add(1);
+            if let Ok(bytes) = (Datagram::Ping { seq, sent_us: 0 }).encode() {
+                let _ = conn.send_datagram(bytes.into());
+            }
+            let event = health.lock().unwrap().check(now);
+            match event {
+                Some(LinkEvent::Down) => tracing::warn!(
+                    "「{name}」{:.0} 秒没有响应（{}）",
+                    DOWN_AFTER.as_secs_f64(),
+                    describe_paths(&conn)
+                ),
+                Some(LinkEvent::Stalled) => {
+                    tracing::warn!(
+                        "「{name}」超过 {} 秒没有响应，暂时不切到这台电脑（{}）",
+                        STALL_AFTER.as_secs(),
+                        describe_paths(&conn)
+                    );
+                    let returned = {
+                        let mut router = self.router.lock().unwrap();
+                        let focused = router.focused() == Some(id.as_str());
+                        if focused {
+                            router.return_home();
+                        }
+                        focused
+                    };
+                    if returned {
+                        tracing::info!("光标已收回本机");
+                    }
+                    self.update_status(&id, &conn, &version, &health);
+                    self.rebuild_world();
+                }
+                None => {}
+            }
+        }
     }
 
     // ------------------------------------------------------------ 剪贴板
@@ -899,8 +1008,15 @@ impl Host {
         result
     }
 
-    fn update_status(&self, id: &str, conn: &iroh::endpoint::Connection, version: &str) {
+    fn update_status(
+        &self,
+        id: &str,
+        conn: &iroh::endpoint::Connection,
+        version: &str,
+        health: &Mutex<LinkHealth>,
+    ) {
         let path = selected_path(conn);
+        let health = health.lock().unwrap().clone();
         self.status.lock().unwrap().insert(
             id.to_string(),
             PeerStatus {
@@ -908,6 +1024,9 @@ impl Host {
                 path: path.as_ref().map(|p| p.0),
                 rtt_ms: path.map(|p| p.2.as_secs_f64() * 1000.0),
                 version: Some(version.to_string()),
+                stalled: health.stalled(),
+                drops: health.drops,
+                longest_drop_ms: health.longest.as_millis() as u64,
                 ..Default::default()
             },
         );
@@ -946,6 +1065,15 @@ fn friendly_error(err: &anyhow::Error) -> String {
         return "对方断开了连接".into();
     }
     text
+}
+
+/// 任务句柄被丢弃时顺带结束任务（外层任务被 abort 时，子任务也跟着结束）。
+struct AbortOnDrop(AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn short_id(id: &str) -> &str {
