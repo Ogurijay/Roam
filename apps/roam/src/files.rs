@@ -12,12 +12,45 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use iroh::endpoint::{Connection, RecvStream};
+use iroh::endpoint::{Connection, ReadError, RecvStream, SendStream, VarInt};
 use roam_proto::{FileDataHeader, FileEntry, FileOffer, encode_side, side};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
 const CHUNK: usize = 256 * 1024;
+
+/// 有文件读不了（例如 macOS 的隐私保护）。重试也没用，等剪贴板换了内容再发。
+#[derive(Debug)]
+pub struct Unreadable(String);
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+/// 发送前确认每个文件都能打开，免得对方收到一半才失败。
+fn check_readable(entries: &[FileEntry], sources: &[PathBuf]) -> Result<()> {
+    for (entry, src) in entries.iter().zip(sources) {
+        if entry.is_dir || entry.size == 0 {
+            continue;
+        }
+        if let Err(err) = std::fs::File::open(src) {
+            // 查文件大小不受限制，读内容会被拦下
+            let hint = if cfg!(target_os = "macos")
+                && err.kind() == std::io::ErrorKind::PermissionDenied
+            {
+                "。macOS 不允许 Roam 读取这个位置：在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里加入 Roam（从终端运行时加入终端），然后重新复制"
+            } else {
+                ""
+            };
+            return Err(Unreadable(format!("无法读取「{}」: {err}{hint}", src.display())).into());
+        }
+    }
+    Ok(())
+}
 
 /// 一次传输的进度，显示在页面和托盘里。
 #[derive(Debug, Clone, Serialize)]
@@ -174,7 +207,12 @@ pub async fn send(
     max_bytes: u64,
     transfers: &Transfers,
 ) -> Result<()> {
-    let (entries, sources) = tokio::task::spawn_blocking(move || collect(&paths)).await??;
+    let (entries, sources) = tokio::task::spawn_blocking(move || {
+        let (entries, sources) = collect(&paths)?;
+        check_readable(&entries, &sources)?;
+        anyhow::Ok((entries, sources))
+    })
+    .await??;
     let offer = FileOffer {
         transfer_id: new_id(),
         entries,
@@ -212,27 +250,12 @@ pub async fn send(
                 transfer_id: id,
                 index: index as u32,
             };
-            stream
-                .write_all(&encode_side(side::FILE_DATA, &header)?)
-                .await?;
-            let mut file = tokio::fs::File::open(src)
-                .await
-                .with_context(|| format!("无法读取 {}", src.display()))?;
-            let mut buf = vec![0u8; CHUNK];
-            let mut sent = 0u64;
-            loop {
-                let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                stream.write_all(&buf[..n]).await?;
-                sent += n as u64;
-                transfers.update(id, |t| t.done += n as u64);
+            let sent = send_one(&mut stream, &header, entry, src, transfers).await;
+            if sent.is_err() {
+                // 显式中止：只是丢掉的话流会被当作正常结束，对方只会看到文件不完整
+                let _ = stream.reset(VarInt::from_u32(1));
             }
-            if sent != entry.size {
-                bail!("{} 在发送过程中被修改了", entry.path);
-            }
-            stream.finish()?;
+            sent?;
         }
         anyhow::Ok(())
     }
@@ -246,6 +269,38 @@ pub async fn send(
         }
     });
     result
+}
+
+/// 在一条单向流上发送一个文件：头部 + 内容。
+async fn send_one(
+    stream: &mut SendStream,
+    header: &FileDataHeader,
+    entry: &FileEntry,
+    src: &Path,
+    transfers: &Transfers,
+) -> Result<()> {
+    stream
+        .write_all(&encode_side(side::FILE_DATA, header)?)
+        .await?;
+    let mut file = tokio::fs::File::open(src)
+        .await
+        .with_context(|| format!("无法读取 {}", src.display()))?;
+    let mut buf = vec![0u8; CHUNK];
+    let mut sent = 0u64;
+    loop {
+        let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        stream.write_all(&buf[..n]).await?;
+        sent += n as u64;
+        transfers.update(header.transfer_id, |t| t.done += n as u64);
+    }
+    if sent != entry.size {
+        bail!("{} 在发送过程中被修改了", entry.path);
+    }
+    stream.finish()?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- 接收
@@ -389,7 +444,15 @@ impl Receiver {
             let mut file = tokio::fs::File::create(&part).await?;
             let mut received = 0u64;
             let mut buf = vec![0u8; CHUNK];
-            while let Some(n) = stream.read(&mut buf).await? {
+            loop {
+                let n = match stream.read(&mut buf).await {
+                    Ok(Some(n)) => n,
+                    Ok(None) => break,
+                    Err(ReadError::Reset(_)) => {
+                        bail!("对方中止了发送（{received}/{size} 字节），原因见对方的日志")
+                    }
+                    Err(err) => return Err(err.into()),
+                };
                 received += n as u64;
                 if received > size {
                     bail!("收到的数据比声明的多");

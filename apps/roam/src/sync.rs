@@ -78,8 +78,10 @@ pub async fn push(
             let count = paths.len();
             if let Err(err) = files::send(conn, paths, peer, policy.max_file_bytes, transfers).await
             {
-                // 失败了允许下次重试
-                *last.lock().unwrap() = None;
+                // 网络问题允许下次切屏时重试；文件读不了就别每次都试，等剪贴板换了内容
+                if !err.is::<files::Unreadable>() {
+                    *last.lock().unwrap() = None;
+                }
                 return Err(err);
             }
             tracing::info!("文件 → {peer}（{count} 项）");

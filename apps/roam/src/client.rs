@@ -315,7 +315,7 @@ impl Client {
         });
         self.refresh_tray();
         injector.lock().unwrap().reset_sequence();
-        // 主机定期发心跳（老版本主机不发，那就不做判断）
+        // 主机定期发心跳（老版本主机不发，收到第一个心跳之前不做判断）
         let health = Arc::new(Mutex::new(LinkHealth::default()));
 
         // 连接刚建立时通常先走中继，打洞成功后切到直连；定期刷新状态
@@ -376,13 +376,13 @@ impl Client {
                     let event = health.lock().unwrap().check(now);
                     match event {
                         Some(LinkEvent::Down) => tracing::warn!(
-                            "{:.0} 秒没有收到主机「{name}」的数据（{}）",
+                            "{:.0} 秒没有收到主机「{name}」的心跳（{}）",
                             DOWN_AFTER.as_secs_f64(),
                             describe_paths(&conn)
                         ),
                         Some(LinkEvent::Stalled) => {
                             tracing::warn!(
-                                "超过 {} 秒没有收到主机「{name}」的数据，松开所有按键（{}）",
+                                "超过 {} 秒没有收到主机「{name}」的心跳，松开所有按键（{}）",
                                 STALL_AFTER.as_secs(),
                                 describe_paths(&conn)
                             );
@@ -424,14 +424,6 @@ impl Client {
             let name = host.name.clone();
             tokio::spawn(async move {
                 while let Ok(bytes) = conn.read_datagram().await {
-                    let outage = health.lock().unwrap().heard(Instant::now());
-                    if let Some(outage) = outage {
-                        tracing::info!(
-                            "恢复收到主机「{name}」的数据，中断了 {:.1} 秒（{}）",
-                            outage.as_secs_f64(),
-                            describe_paths(&conn)
-                        );
-                    }
                     match Datagram::decode(&bytes) {
                         Ok(Datagram::MouseAbs { seq, x, y }) => {
                             injector.lock().unwrap().mouse_abs(seq, x, y)
@@ -439,6 +431,15 @@ impl Client {
                         Ok(Datagram::Ping { seq, sent_us }) => {
                             let pong = Datagram::Pong { seq, sent_us }.encode().expect("encode");
                             let _ = conn.send_datagram(pong.into());
+                            // 只有心跳才算数：鼠标不动、光标在别的电脑上时主机本来就不发移动数据
+                            let outage = health.lock().unwrap().heard(Instant::now());
+                            if let Some(outage) = outage {
+                                tracing::info!(
+                                    "恢复收到主机「{name}」的心跳，中断了 {:.1} 秒（{}）",
+                                    outage.as_secs_f64(),
+                                    describe_paths(&conn)
+                                );
+                            }
                         }
                         _ => {}
                     }
