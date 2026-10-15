@@ -829,7 +829,8 @@ function renderUpdate() {
   setValue($('mirror'), state.host.update_mirror || '');
   const parts = [];
   if (u.available) parts.push(`<b>发现新版本 v${esc(u.latest.version)}</b> <button class="primary small" data-apply-update>更新所有设备</button>${u.latest.notes ? `<pre class="muted" style="white-space:pre-wrap;margin:8px 0 0">${esc(u.latest.notes)}</pre>` : ''}`);
-  else if (u.latest) parts.push('<span style="color:var(--ok)">已经是最新版本</span>');
+  else if (u.latest) parts.push(`<span style="color:var(--ok)">本机已经是最新版本</span> <button class="primary small" data-apply-update>同步其他设备</button>`);
+  if (u.phase) parts.push(`<div class="muted" style="margin-top:6px">${esc(u.phase)}</div>`);
   if (u.error) parts.push(`<div class="err">${esc(u.error)}</div>`);
   if (u.devices.length) parts.push(`<div class="muted" style="margin-top:6px">${u.devices.map(([n, r]) => `${esc(n)}：${esc(r)}`).join('；')}</div>`);
   setHtml($('updResult'), parts.join(''));
@@ -843,7 +844,7 @@ $('checkUpdate').addEventListener('click', async e => {
 $('mirror').addEventListener('change', e => api('PUT', '/api/settings', { update_mirror: e.target.value }).then(() => toast('已保存')).catch(err => toast(err.message)));
 document.addEventListener('click', async e => {
   if (e.target.dataset?.applyUpdate === undefined) return;
-  if (!confirm('将先把新版本推送给所有在线设备，再更新本机。更新期间会短暂断开几秒。继续吗？')) return;
+  if (!confirm('将把最新版推送给需要更新的在线设备；本机有新版时也会更新并重启。离线设备可在连接后再次同步。继续吗？')) return;
   try { await api('POST', '/api/update/apply'); refresh(); } catch (err) { toast(err.message); }
 });
 

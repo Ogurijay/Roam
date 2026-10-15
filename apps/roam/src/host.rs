@@ -247,6 +247,7 @@ impl Host {
             match (&u.phase, &u.latest) {
                 (Some(phase), _) => Some(phase.clone()),
                 (None, Some(r)) if u.available => Some(format!("更新到 v{}", r.version)),
+                (None, Some(r)) => Some(format!("同步其他设备到 v{}", r.version)),
                 _ => None,
             }
         };
@@ -1118,10 +1119,8 @@ impl Host {
     async fn update_all_inner(self: Arc<Self>) -> Result<()> {
         self.updater.set_error(None);
         self.updater.state.lock().unwrap().devices.clear();
-        if self.updater.state.lock().unwrap().latest.is_none() {
-            self.updater.set_phase(Some("正在检查更新…".into()));
-            self.updater.check().await?;
-        }
+        self.updater.set_phase(Some("正在检查更新…".into()));
+        self.updater.check().await?;
         let (release, available) = {
             let state = self.updater.state.lock().unwrap();
             (
@@ -1129,16 +1128,7 @@ impl Host {
                 state.available,
             )
         };
-        if !available {
-            bail!("已经是最新版本");
-        }
         let mirror = self.mirror();
-
-        // 先下载本机的安装包，确保主机自己能更新成功再动被控端
-        let own = self
-            .updater
-            .fetch(&release, Os::current(), mirror.as_deref())
-            .await?;
 
         let peers: Vec<Peer> = self
             .config
@@ -1149,6 +1139,7 @@ impl Host {
             .filter(|p| p.settings.enabled)
             .cloned()
             .collect();
+        let mut failures = Vec::new();
         for peer in peers {
             let current = self
                 .status
@@ -1156,28 +1147,44 @@ impl Host {
                 .unwrap()
                 .get(&peer.id)
                 .and_then(|s| s.version.clone());
-            if current.as_deref() == Some(release.version.as_str()) {
+            if !update::needs_update(current.as_deref(), &release.version) {
                 self.record_update(&peer.name, "已是最新");
                 continue;
             }
+            // 更新通道独立于控制协议，即使版本不兼容、控制连接失败，也应尝试升级。
             let result = self.push_release(&peer, &release, mirror.as_deref()).await;
-            self.record_update(
-                &peer.name,
-                &match result {
-                    Ok(()) => "已更新".to_string(),
-                    Err(err) => format!("{err:#}"),
-                },
-            );
+            match result {
+                Ok(()) => self.record_update(&peer.name, "已安装，等待设备重启重连"),
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    self.record_update(&peer.name, &message);
+                    failures.push(format!("{}：{message}", peer.name));
+                }
+            }
         }
+
+        self.updater.save_results();
+        if !available {
+            self.updater.set_phase(None);
+            if !failures.is_empty() {
+                bail!("部分设备更新失败，请重试：{}", failures.join("；"));
+            }
+            return Ok(());
+        }
+        // 本机下载失败不应阻止其他系统的被控端先更新。
+        let own = self
+            .updater
+            .fetch(&release, Os::current(), mirror.as_deref())
+            .await?;
 
         self.updater.set_phase(Some(format!(
             "正在更新本机到 v{}，马上重启…",
             release.version
         )));
         self.router.lock().unwrap().return_home();
-        update::install(&own)?;
+        let exe = update::install(&own)?;
         tokio::time::sleep(Duration::from_millis(800)).await;
-        update::restart();
+        update::restart_at(&exe);
     }
 
     fn record_update(&self, name: &str, result: &str) {
@@ -1196,12 +1203,28 @@ impl Host {
         release: &update::Release,
         mirror: Option<&str>,
     ) -> Result<()> {
-        // 不知道对方系统时（从没连上过）按 Windows 处理，目前被控端只有 Windows
-        let os = peer.os.unwrap_or(Os::Windows);
+        let os = peer.os.context("尚未连接过这台设备，无法确定安装包平台")?;
         let bin = self.updater.fetch(release, os, mirror).await?;
         self.updater
             .set_phase(Some(format!("正在推送到「{}」…", peer.name)));
-        let addr = ticket::decode(&peer.ticket)?;
+        let fresh = self.nearby.get(&peer.id).map(|d| d.ticket);
+        let saved = self
+            .config
+            .lock()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|p| p.id == peer.id)
+            .map(|p| p.ticket.clone());
+        let addr = ticket::decode(
+            fresh
+                .as_deref()
+                .or(saved.as_deref())
+                .unwrap_or(&peer.ticket),
+        )?;
+        if addr.id.to_string() != peer.id {
+            bail!("设备连接码与已配对的设备不符，请重新发现设备");
+        }
         update::push(&self.endpoint, addr, &bin, &release.version).await
     }
 
@@ -1216,6 +1239,24 @@ impl Host {
             .find(|p| p.id == id)
             .cloned()
             .context("没有这台设备")?;
+        let current = self
+            .status
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|s| s.version.clone());
+        if !update::needs_update(current.as_deref(), roam_proto::VERSION) {
+            self.record_update(&peer.name, "已是当前或更高版本，无需同步");
+            self.updater.save_results();
+            return Ok(());
+        }
+        {
+            let mut updating = self.updating.lock().unwrap();
+            if *updating {
+                bail!("正在更新中，请等待当前任务完成");
+            }
+            *updating = true;
+        }
         self.updater.set_error(None);
         let result = async {
             let release = self.updater.release_for(roam_proto::VERSION).await?;
@@ -1223,13 +1264,17 @@ impl Host {
                 .await
         }
         .await;
+        *self.updating.lock().unwrap() = false;
         self.updater.set_phase(None);
         match &result {
             Ok(()) => self.record_update(&peer.name, "已同步"),
-            Err(err) => self
-                .updater
-                .set_error(Some(format!("同步「{}」失败：{err:#}", peer.name))),
+            Err(err) => {
+                self.record_update(&peer.name, &format!("同步失败：{err:#}"));
+                self.updater
+                    .set_error(Some(format!("同步「{}」失败：{err:#}", peer.name)));
+            }
         }
+        self.updater.save_results();
         result
     }
 

@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
 /// 发布新版本的仓库。
-pub const REPO: &str = "Ogurijay/roam";
+pub const REPO: &str = "Ogurijay/Roam";
 
 /// 各平台安装包的文件名（与发布脚本保持一致）。
 pub fn asset_name(os: Os) -> Option<&'static str> {
@@ -117,6 +117,14 @@ pub fn is_newer(a: &str, b: &str) -> bool {
     }
 }
 
+/// 单独判断每台设备，主机已是最新版时仍能补齐旧被控端；不降级更新。
+pub fn needs_update(current: Option<&str>, target: &str) -> bool {
+    match current.and_then(|v| semver::Version::parse(v).ok()) {
+        Some(current) => semver::Version::parse(target).is_ok_and(|target| target > current),
+        None => true,
+    }
+}
+
 impl Updater {
     pub fn new(endpoint: &Endpoint, cache: PathBuf) -> Result<Self> {
         // 复用 iroh 的 TLS 配置（含根证书），不额外引入一套 TLS 实现
@@ -126,12 +134,18 @@ impl Updater {
             .tls_backend_preconfigured(tls)
             .user_agent(format!("roam/{VERSION}"))
             .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(60))
             .build()?;
+        let devices = std::fs::read(cache.join("last-update.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         Ok(Self {
             client,
             cache,
             state: Mutex::new(UpdateState {
                 current: VERSION.into(),
+                devices,
                 ..Default::default()
             }),
         })
@@ -150,6 +164,22 @@ impl Updater {
         self.state.lock().unwrap().error = error;
     }
 
+    /// 重启后仍能看到哪些被控端更新失败，避免只剩普通连接错误。
+    pub fn save_results(&self) {
+        let result = (|| -> Result<()> {
+            std::fs::create_dir_all(&self.cache)?;
+            let devices = self.state.lock().unwrap().devices.clone();
+            std::fs::write(
+                self.cache.join("last-update.json"),
+                serde_json::to_vec(&devices)?,
+            )?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            tracing::warn!("保存设备更新结果失败：{err:#}");
+        }
+    }
+
     async fn get_release(&self, path: &str) -> Result<Release> {
         let url = format!("{}/{path}", Self::api_base());
         let resp = self
@@ -159,7 +189,7 @@ impl Updater {
             .timeout(Duration::from_secs(20))
             .send()
             .await
-            .context("无法连接 GitHub")?;
+            .context("无法连接 GitHub 更新接口；请检查系统代理或网络设置")?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             bail!("还没有发布任何版本");
         }
@@ -187,6 +217,7 @@ impl Updater {
             }
             Err(err) => {
                 state.error = Some(format!("检查更新失败：{err:#}"));
+                tracing::warn!("检查更新失败：{err:#}");
                 Err(err)
             }
         }
@@ -200,6 +231,7 @@ impl Updater {
     /// 下载某个平台的安装包并校验 SHA256，已经下载过就直接用缓存。
     pub async fn fetch(&self, release: &Release, os: Os, mirror: Option<&str>) -> Result<PathBuf> {
         let name = asset_name(os).context("这个平台没有安装包")?;
+        self.set_phase(Some(format!("正在获取 {name} 的校验和…")));
         let asset = release
             .assets
             .iter()
@@ -215,6 +247,7 @@ impl Updater {
         }
 
         let url = with_mirror(&asset.url, mirror);
+        self.set_phase(Some(format!("正在连接下载 {name}…")));
         let mut resp = self
             .client
             .get(&url)
@@ -321,46 +354,100 @@ fn old_path(exe: &Path) -> PathBuf {
     exe.with_file_name(format!("{name}.old"))
 }
 
-/// 用新程序替换当前程序。运行中的程序不能覆盖，但可以改名，所以先把自己改名再放新文件。
-pub fn install(new_bin: &Path) -> Result<()> {
+/// 完整准备新程序后再替换；返回替换前保存的启动路径。
+pub fn install(new_bin: &Path) -> Result<PathBuf> {
+    // 必须在替换前保存路径：部分系统在运行文件改名后，current_exe 会指向旧文件。
     let exe = std::env::current_exe().context("找不到当前程序路径")?;
-    let old = old_path(&exe);
-    let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old).context("无法替换当前程序（权限不足？）")?;
-    if let Err(err) = std::fs::copy(new_bin, &exe) {
-        let _ = std::fs::rename(&old, &exe);
-        return Err(err).context("写入新程序失败，已还原");
+    install_at(new_bin, &exe)?;
+    Ok(exe)
+}
+
+fn install_at(new_bin: &Path, exe: &Path) -> Result<()> {
+    let prepared = exe.with_file_name(format!(
+        "{}.update-{}",
+        exe.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let result = prepare_install(new_bin, exe, &prepared);
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&prepared);
+        return Err(err);
     }
+    let old = old_path(exe);
+    let result = replace_prepared(&prepared, exe, &old);
+    let _ = std::fs::remove_file(&prepared);
+    result
+}
+
+fn prepare_install(new_bin: &Path, exe: &Path, prepared: &Path) -> Result<()> {
+    std::fs::copy(new_bin, prepared).context("无法写入新程序，请检查程序所在文件夹的写入权限")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(prepared, std::fs::Permissions::from_mode(0o755))?;
     }
     #[cfg(target_os = "macos")]
     {
-        // 去掉隔离属性，避免 Gatekeeper 拦截
+        // 在替换之前验证发布包的签名，避免旧程序已经移走才发现新文件无法运行。
+        let status = std::process::Command::new("/usr/bin/codesign")
+            .args(["--verify", "--strict"])
+            .arg(prepared)
+            .status()
+            .context("无法检查 Mac 安装包签名")?;
+        if !status.success() {
+            bail!("Mac 安装包签名验证失败，已保留原程序");
+        }
         let _ = std::process::Command::new("xattr")
             .args(["-d", "com.apple.quarantine"])
-            .arg(&exe)
+            .arg(prepared)
             .status();
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(prepared)?
+        .sync_all()?;
+    // 在改动原程序前确认它存在，下载失败等情况不影响正在运行的程序。
+    std::fs::metadata(exe).context("找不到待替换的原程序")?;
+    Ok(())
+}
+
+fn replace_prepared(prepared: &Path, exe: &Path, old: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::copy(exe, old).context("无法备份当前程序，请检查文件夹写入权限")?;
+        // 同目录 rename 原子替换，复制、权限或签名失败不会留下一半安装的程序。
+        std::fs::rename(prepared, exe).context("无法替换当前程序，原程序保持不变")?;
+    }
+    #[cfg(not(unix))]
+    {
+        if old.exists() {
+            std::fs::remove_file(old).context("旧程序仍被占用，请稍后重试更新")?;
+        }
+        std::fs::rename(exe, old).context("无法替换当前程序（权限不足？）")?;
+        if let Err(err) = std::fs::rename(prepared, exe) {
+            std::fs::rename(old, exe).context("写入新程序失败，而且无法还原原程序")?;
+            return Err(err).context("写入新程序失败，已还原");
+        }
     }
     Ok(())
 }
 
 /// 用同样的参数重新启动自己。macOS 上直接替换进程（保持同一个 PID，launchd 与终端都不受影响）。
-pub fn restart() -> ! {
-    let exe = std::env::current_exe().expect("current exe");
+pub fn restart_at(exe: &Path) -> ! {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(&exe).args(&args).exec();
+        let err = std::process::Command::new(exe).args(&args).exec();
         eprintln!("重启失败: {err}");
         std::process::exit(1);
     }
     #[cfg(not(unix))]
     {
-        let _ = std::process::Command::new(&exe).args(&args).spawn();
+        if let Err(err) = std::process::Command::new(exe).args(&args).spawn() {
+            tracing::error!("新版已安装，但重启失败：{err}");
+            std::process::exit(1);
+        }
         std::process::exit(0);
     }
 }
@@ -508,22 +595,153 @@ pub async fn receive(conn: Connection, trusted: bool, staging: PathBuf) -> Resul
         write_frame(&mut send, &UpdateReply::Rejected("校验失败".into())).await?;
         bail!("更新文件校验失败");
     }
-    if let Err(err) = install(&tmp) {
-        write_frame(&mut send, &UpdateReply::Rejected(format!("{err:#}"))).await?;
-        return Err(err);
-    }
+    let exe = match install(&tmp) {
+        Ok(exe) => exe,
+        Err(err) => {
+            write_frame(&mut send, &UpdateReply::Rejected(format!("{err:#}"))).await?;
+            return Err(err);
+        }
+    };
     let _ = std::fs::remove_file(&tmp);
     write_frame(&mut send, &UpdateReply::Installed).await?;
     send.finish()?;
     // 等回复送达再重启
     let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
     println!("已更新到 v{}，正在重启…", offer.version);
-    restart();
+    restart_at(&exe);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "roam-install-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn latest_host_still_updates_an_older_peer_without_downgrading() {
+        assert!(!needs_update(Some("0.3.0"), "0.3.0"));
+        assert!(needs_update(Some("0.2.0"), "0.3.0"));
+        assert!(!needs_update(Some("0.4.0"), "0.3.0"));
+        assert!(needs_update(None, "0.3.0"));
+        assert!(needs_update(Some("unknown"), "0.3.0"));
+    }
+
+    #[tokio::test]
+    async fn pushes_over_update_channel_without_a_control_connection() {
+        use iroh::endpoint::presets;
+
+        let sender = Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let receiver = Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .alpns(vec![UPDATE_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let addr = EndpointAddr::new(receiver.id()).with_ip_addr(receiver.bound_sockets()[0]);
+        let dir = TestDir::new();
+        let bin = dir.0.join("release.bin");
+        let payload = b"release bytes for an older peer";
+        std::fs::write(&bin, payload).unwrap();
+        let expected = sha256_file(&bin).unwrap();
+        let server = tokio::spawn(async move {
+            let conn = receiver.accept().await.unwrap().await.unwrap();
+            assert_eq!(conn.alpn(), UPDATE_ALPN);
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let offer: UpdateOffer = read_frame(&mut recv).await.unwrap();
+            assert_eq!(offer.version, "0.3.0");
+            assert_eq!(offer.sha256, expected);
+            assert_eq!(offer.size, payload.len() as u64);
+            let bytes = recv.read_to_end(1024).await.unwrap();
+            assert_eq!(bytes.as_slice(), payload);
+            write_frame(&mut send, &UpdateReply::Installed)
+                .await
+                .unwrap();
+            send.finish().unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+            receiver.close().await;
+        });
+        tokio::time::timeout(Duration::from_secs(15), push(&sender, addr, &bin, "0.3.0"))
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        sender.close().await;
+    }
+
+    #[test]
+    fn failed_preparation_leaves_original_executable_untouched() {
+        let dir = TestDir::new();
+        let exe = dir.0.join("roam");
+        std::fs::write(&exe, b"original").unwrap();
+        assert!(install_at(&dir.0.join("missing-download"), &exe).is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"original");
+        assert!(!old_path(&exe).exists());
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn installation_keeps_backup_and_makes_the_new_file_executable() {
+        let dir = TestDir::new();
+        let exe = dir.0.join("roam");
+        let download = dir.0.join("download");
+        std::fs::write(&exe, b"old version").unwrap();
+        std::fs::write(&download, b"new version").unwrap();
+        install_at(&download, &exe).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new version");
+        assert_eq!(std::fs::read(old_path(&exe)).unwrap(), b"old version");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                std::fs::metadata(&exe).unwrap().permissions().mode() & 0o111,
+                0
+            );
+        }
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 3);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn invalid_mac_signature_keeps_the_original() {
+        let dir = TestDir::new();
+        let exe = dir.0.join("roam");
+        let download = dir.0.join("download");
+        std::fs::write(&exe, b"original").unwrap();
+        std::fs::write(&download, b"not a signed Mach-O").unwrap();
+        assert!(install_at(&download, &exe).is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"original");
+        assert!(!old_path(&exe).exists());
+    }
 
     #[test]
     fn versions_compare() {

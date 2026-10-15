@@ -61,6 +61,9 @@ jobs:
             target/aarch64-apple-darwin/release/roam \
             target/x86_64-apple-darwin/release/roam
           codesign --force --sign - ${{ matrix.asset }}
+          codesign --verify --strict ${{ matrix.asset }}
+          chmod +x ${{ matrix.asset }}
+          ./${{ matrix.asset }} --version
 
       - uses: actions/upload-artifact@v4
         with:

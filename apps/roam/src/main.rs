@@ -229,8 +229,8 @@ fn run_with_tray(
                 if let App::Host(host) = &app {
                     let host = host.clone();
                     runtime.spawn(async move {
-                        let available = host.updater.state.lock().unwrap().available;
-                        if available {
+                        let checked = host.updater.state.lock().unwrap().latest.is_some();
+                        if checked {
                             let _ = host.update_all().await;
                         } else {
                             let _ = host.updater.check().await;
