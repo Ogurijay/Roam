@@ -56,6 +56,8 @@ pub struct Client {
     sessions: Mutex<std::collections::HashMap<String, Connection>>,
     /// 本机注入键鼠所需的系统权限是否就绪；失败时为说明。
     pub permission: Result<(), String>,
+    /// 最近一次因为目标是管理员程序而没法注入：程序名和时间（界面提示用）。
+    pub elevated_blocked: Arc<Mutex<Option<(String, std::time::Instant)>>>,
     tray: Mutex<Option<TrayHandle>>,
     _advertiser: Option<discovery::Advertiser>,
 }
@@ -99,6 +101,7 @@ impl Client {
             pending: Mutex::new(None),
             sessions: Mutex::new(std::collections::HashMap::new()),
             permission,
+            elevated_blocked: Default::default(),
             tray: Mutex::new(None),
             _advertiser: advertiser,
         });
@@ -151,7 +154,7 @@ impl Client {
     }
 
     async fn accept_loop(self: Arc<Self>, endpoint: iroh::Endpoint) {
-        let injector = Arc::new(Mutex::new(Sink::new()));
+        let injector = Arc::new(Mutex::new(Sink::new(self.elevated_blocked.clone())));
         // 同一时间只弹一个授权窗口
         let prompt_lock = Arc::new(tokio::sync::Mutex::new(()));
         let addr_endpoint = endpoint.clone();
@@ -633,12 +636,23 @@ struct Sink {
     helper: crate::winsvc::HelperLink,
     #[cfg(windows)]
     secure: bool,
+    /// 目标窗口属于管理员程序（本进程注入不进去）时的程序名。
+    #[cfg(windows)]
+    elevated: Option<String>,
+    /// 用户允许交给输入助手去控制管理员程序。
+    #[cfg(windows)]
+    allow_elevated: bool,
     #[cfg(windows)]
     checked: Option<std::time::Instant>,
+    /// 上次在日志里提示的程序和时间，避免刷屏。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    warned: Option<(String, std::time::Instant)>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    blocked: Arc<Mutex<Option<(String, std::time::Instant)>>>,
 }
 
 impl Sink {
-    fn new() -> Self {
+    fn new(blocked: Arc<Mutex<Option<(String, std::time::Instant)>>>) -> Self {
         Self {
             local: Injector::new(),
             last_seq: None,
@@ -648,22 +662,67 @@ impl Sink {
             #[cfg(windows)]
             secure: false,
             #[cfg(windows)]
+            elevated: None,
+            #[cfg(windows)]
+            allow_elevated: false,
+            #[cfg(windows)]
             checked: None,
+            warned: None,
+            blocked,
         }
     }
 
     /// 尝试交给输入助手；返回 false 表示应由本进程自己注入。
     #[cfg(windows)]
     fn via_helper(&mut self, msg: crate::winsvc::HelperMsg) -> bool {
-        // 每 200 毫秒检查一次当前是不是安全桌面（锁屏 / UAC）
+        // 每 200 毫秒检查一次：是不是安全桌面（锁屏 / UAC），目标窗口是不是管理员程序
         if self
             .checked
             .is_none_or(|t| t.elapsed() > Duration::from_millis(200))
         {
             self.secure = crate::winsvc::secure_desktop_active();
+            self.elevated = if self.secure {
+                None
+            } else {
+                crate::winsvc::elevated_target()
+            };
+            self.allow_elevated = self.elevated.is_some() && crate::winsvc::allow_elevated();
             self.checked = Some(std::time::Instant::now());
         }
-        self.secure && self.helper.send(&msg)
+        if self.secure {
+            return self.helper.send(&msg);
+        }
+        let Some(app) = self.elevated.clone() else {
+            return false;
+        };
+        let sent = self.allow_elevated && self.helper.send(&msg);
+        if !sent {
+            self.note_blocked(app);
+        }
+        sent
+    }
+
+    /// 目标是管理员程序、键鼠送不进去：记下来给界面看，日志里每个程序每分钟提示一次。
+    #[cfg(windows)]
+    fn note_blocked(&mut self, app: String) {
+        let now = std::time::Instant::now();
+        *self.blocked.lock().unwrap() = Some((app.clone(), now));
+        if self
+            .warned
+            .as_ref()
+            .is_some_and(|(a, t)| *a == app && t.elapsed() < Duration::from_secs(60))
+        {
+            return;
+        }
+        if self.allow_elevated {
+            tracing::warn!("「{app}」以管理员身份运行，需要锁屏控制服务代为输入，但服务没有运行");
+        } else {
+            tracing::warn!(
+                "「{app}」以管理员身份运行，Windows 不允许普通程序向它输入键鼠。\
+                 可以取消它的「以管理员身份运行」，或在「锁屏控制」里打开「允许控制管理员程序」"
+            );
+        }
+        self.warned = Some((app, now));
     }
 
     #[cfg(not(windows))]

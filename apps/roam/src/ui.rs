@@ -167,6 +167,10 @@ struct ClientView {
     status: String,
     /// Windows 锁屏控制服务的状态："not_installed" / "stopped" / "running"；其他系统为 None。
     lock_control: Option<&'static str>,
+    /// 是否允许控制以管理员身份运行的程序（Windows）。
+    allow_elevated: Option<bool>,
+    /// 最近 30 秒内因为是管理员程序而控制不了的程序名。
+    elevated_blocked: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -309,6 +313,14 @@ fn client_state(client: &Client) -> StateView {
                 .collect(),
             status,
             lock_control: lock_control_status(),
+            allow_elevated: allow_elevated_status(),
+            elevated_blocked: client
+                .elevated_blocked
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(_, t)| t.elapsed() < std::time::Duration::from_secs(30))
+                .map(|(app, _)| app.clone()),
         }),
     }
 }
@@ -320,6 +332,13 @@ fn lock_control_status() -> Option<&'static str> {
         crate::winsvc::ServiceStatusView::Stopped => "stopped",
         crate::winsvc::ServiceStatusView::Running => "running",
     });
+    #[allow(unreachable_code)]
+    None
+}
+
+fn allow_elevated_status() -> Option<bool> {
+    #[cfg(windows)]
+    return Some(crate::winsvc::allow_elevated());
     #[allow(unreachable_code)]
     None
 }
@@ -620,7 +639,7 @@ async fn copy_ticket(State(app): State<App>) -> ApiResult {
 /// 安装 / 卸载 Windows 锁屏控制服务（会弹出管理员确认）。
 async fn lock_control(State(app): State<App>, Path(action): Path<String>) -> ApiResult {
     app.client()?;
-    if action != "install" && action != "uninstall" {
+    if !["install", "uninstall", "allow-elevated", "deny-elevated"].contains(&action.as_str()) {
         return Err(anyhow::anyhow!("未知操作").into());
     }
     #[cfg(windows)]

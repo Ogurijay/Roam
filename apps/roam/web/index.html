@@ -313,6 +313,8 @@
           <h3>锁屏控制</h3>
           <p class="muted small" style="margin:0 0 8px">Windows 锁屏后，普通程序收不到远程键鼠。启用后会安装一个系统服务（需要管理员确认一次），锁屏时也能用主机的键鼠输入密码解锁。只在锁屏界面生效，不处理管理员确认（UAC）弹窗。</p>
           <div class="row"><span class="grow" id="lockStatus"></span><button id="lockUninstall" class="small danger">停用</button><button id="lockInstall" class="primary small">启用</button></div>
+          <label class="check" id="adminRow" style="margin-top:10px" hidden><input type="checkbox" id="adminControl"><span>允许控制以管理员身份运行的程序<br><span class="muted small">Windows 不允许普通程序向管理员窗口输入键鼠，光标移上去就像断开了。打开后由上面的系统服务代为输入（需要管理员确认一次）。代价：本机的恶意程序如果劫持了 Roam，也能借此操作管理员窗口。UAC 确认弹窗仍然不能控制。</span></span></label>
+          <div class="err" id="adminBlocked" hidden></div>
         </div>
         <div class="card" id="clientTransferCard" hidden>
           <div class="row"><h3 class="grow" style="margin:0">文件传输</h3><button class="link small" data-open-downloads>打开接收文件夹</button></div>
@@ -879,7 +881,28 @@ function renderLockCard(c) {
   $('lockInstall').hidden = c.lock_control === 'running';
   $('lockInstall').textContent = c.lock_control === 'stopped' ? '重新启用' : '启用';
   $('lockUninstall').hidden = c.lock_control === 'not_installed';
+  $('adminRow').hidden = c.lock_control !== 'running';
+  if (!adminBusy) $('adminControl').checked = !!c.allow_elevated;
+  const blocked = c.elevated_blocked;
+  $('adminBlocked').hidden = !blocked;
+  if (blocked) setHtml($('adminBlocked'), c.allow_elevated
+    ? `「${esc(blocked)}」以管理员身份运行，需要上面的服务代为输入，但服务没有运行`
+    : `「${esc(blocked)}」以管理员身份运行，Windows 不允许 Roam 控制它。可以打开上面的开关，或者取消它的「以管理员身份运行」`);
 }
+let adminBusy = false;
+$('adminControl').addEventListener('change', async e => {
+  const on = e.target.checked;
+  if (on && !confirm('打开后，Roam 可以控制以管理员身份运行的程序。本机的恶意程序如果劫持了 Roam，也能借此操作这些窗口。继续吗？')) {
+    e.target.checked = false;
+    return;
+  }
+  adminBusy = true;
+  e.target.disabled = true;
+  toast('请在弹出的窗口里确认管理员授权…');
+  try { await api('POST', `/api/lock-control/${on ? 'allow-elevated' : 'deny-elevated'}`); toast(on ? '已允许控制管理员程序' : '已关闭'); }
+  catch (err) { toast(err.message); }
+  finally { adminBusy = false; e.target.disabled = false; refresh(); }
+});
 async function lockControl(action, btn) {
   btn.disabled = true;
   toast(action === 'install' ? '请在弹出的窗口里确认管理员授权…' : '请在弹出的窗口里确认…');

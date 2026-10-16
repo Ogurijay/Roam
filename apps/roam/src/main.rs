@@ -80,7 +80,7 @@ enum Cmd {
     /// Windows 锁屏控制服务（由界面调用，一般不需要手动运行）
     #[command(hide = true)]
     Service {
-        /// install / uninstall / run
+        /// install / uninstall / run / allow-elevated / deny-elevated
         action: String,
         #[arg(long)]
         log_dir: PathBuf,
@@ -265,6 +265,8 @@ fn run_system_component(cmd: Cmd) -> Result<()> {
                 let result = match action.as_str() {
                     "install" => winsvc::install(&log_dir),
                     "uninstall" => winsvc::uninstall(),
+                    "allow-elevated" => winsvc::set_allow_elevated(true),
+                    "deny-elevated" => winsvc::set_allow_elevated(false),
                     "run" => winsvc::run_service(),
                     other => Err(anyhow::anyhow!("未知操作 {other}")),
                 };

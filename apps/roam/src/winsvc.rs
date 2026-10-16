@@ -9,6 +9,11 @@
 //!
 //! 安全限制：助手**只在会话处于锁定状态时**注入（不处理 UAC 弹窗，否则任何本地程序都能借它
 //! 绕过管理员确认），并且只接受 Roam 程序本身的连接。
+//!
+//! 可选：「允许控制以管理员身份运行的程序」。Windows 不允许普通程序向管理员窗口注入键鼠（UIPI），
+//! 光标移到这种窗口上就像断开了一样。打开后，目标是管理员程序时也交给助手注入。开关存在
+//! `HKLM\SOFTWARE\Roam`，只有管理员能改（打开要确认一次 UAC）；助手注入前会自己再核实一遍
+//! 开关、当前是普通桌面（UAC 弹窗所在的安全桌面仍然不处理）、目标确实是管理员程序。
 
 use std::{
     ffi::OsString,
@@ -34,23 +39,33 @@ use windows_service::{
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
+    Foundation::{
+        CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, LocalFree, POINT,
+    },
     Security::{
         Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW, DuplicateTokenEx,
-        SECURITY_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS,
-        TokenPrimary, TokenSessionId,
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, SECURITY_ATTRIBUTES,
+        SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TokenIntegrityLevel, TokenPrimary, TokenSessionId,
     },
     System::{
         Pipes::{
             ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
             PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
         },
+        Registry::{
+            HKEY_LOCAL_MACHINE, REG_DWORD, RRF_RT_REG_DWORD, RegDeleteKeyValueW, RegGetValueW,
+            RegSetKeyValueW,
+        },
         RemoteDesktop::{
             ProcessIdToSessionId, WTS_SESSIONSTATE_LOCK, WTSFreeMemory,
             WTSGetActiveConsoleSessionId, WTSINFOEXW, WTSQuerySessionInformationW,
             WTSSessionInfoEx,
         },
-        StationsAndDesktops::{CloseDesktop, HDESK, OpenInputDesktop, SetThreadDesktop},
+        StationsAndDesktops::{
+            CloseDesktop, GetUserObjectInformationW, HDESK, OpenInputDesktop, SetThreadDesktop,
+            UOI_NAME,
+        },
         Threading::{
             CREATE_NO_WINDOW, CreateProcessAsUserW, GetCurrentProcess, GetCurrentProcessId,
             GetExitCodeProcess, INFINITE, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
@@ -58,7 +73,12 @@ use windows_sys::Win32::{
             TerminateProcess, WaitForSingleObject,
         },
     },
-    UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
+    UI::{
+        Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
+        WindowsAndMessaging::{
+            GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, WindowFromPoint,
+        },
+    },
 };
 
 pub const SERVICE_NAME: &str = "RoamService";
@@ -184,8 +204,178 @@ pub fn uninstall() -> Result<()> {
         let _ = service.stop();
     }
     service.delete()?;
+    let _ = set_allow_elevated(false);
     tracing::info!("已卸载 {SERVICE_NAME}");
     Ok(())
+}
+
+// ---------------------------------------------------------------- 控制管理员程序（可选）
+
+const REG_KEY: &str = r"SOFTWARE\Roam";
+const REG_ALLOW_ELEVATED: &str = "AllowElevated";
+/// 完整性级别：管理员程序是 High（0x3000）。
+const HIGH_INTEGRITY: u32 = 0x3000;
+
+/// 是否允许输入助手向以管理员身份运行的程序注入键鼠。
+pub fn allow_elevated() -> bool {
+    let key = wide(REG_KEY);
+    let name = wide(REG_ALLOW_ELEVATED);
+    let mut data = 0u32;
+    let mut size = size_of::<u32>() as u32;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut data as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    result == 0 && data != 0
+}
+
+/// 打开 / 关闭「允许控制管理员程序」（需要在管理员进程里调用）。
+pub fn set_allow_elevated(on: bool) -> Result<()> {
+    let key = wide(REG_KEY);
+    let name = wide(REG_ALLOW_ELEVATED);
+    let result = if on {
+        let data = 1u32;
+        unsafe {
+            RegSetKeyValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                name.as_ptr(),
+                REG_DWORD,
+                (&data as *const u32).cast(),
+                size_of::<u32>() as u32,
+            )
+        }
+    } else {
+        unsafe { RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), name.as_ptr()) }
+    };
+    if result != 0 && !(result == ERROR_FILE_NOT_FOUND && !on) {
+        bail!(
+            "写注册表失败: {}",
+            std::io::Error::from_raw_os_error(result as i32)
+        );
+    }
+    tracing::info!(
+        "{}控制以管理员身份运行的程序",
+        if on { "已允许" } else { "已禁止" }
+    );
+    Ok(())
+}
+
+/// 进程的完整性级别（普通程序 0x2000，管理员 0x3000，SYSTEM 0x4000）。
+/// 进程打不开（受保护的系统进程等）返回 None；能打开但读不了令牌，说明权限比我们高，返回 `u32::MAX`。
+fn integrity_level(pid: u32) -> Option<u32> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+        CloseHandle(process);
+        if opened == 0 {
+            return Some(u32::MAX);
+        }
+        let mut buf = [0u64; 16];
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            buf.as_mut_ptr().cast(),
+            size_of_val(&buf) as u32,
+            &mut len,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return Some(u32::MAX);
+        }
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let count = *GetSidSubAuthorityCount(label.Label.Sid);
+        if count == 0 {
+            return None;
+        }
+        Some(*GetSidSubAuthority(label.Label.Sid, (count - 1) as u32))
+    }
+}
+
+/// 前台窗口和鼠标下面的窗口所属的进程。
+fn target_pids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    unsafe {
+        let mut point = POINT { x: 0, y: 0 };
+        let under_cursor = if GetCursorPos(&mut point) != 0 {
+            WindowFromPoint(point)
+        } else {
+            std::ptr::null_mut()
+        };
+        for hwnd in [GetForegroundWindow(), under_cursor] {
+            if hwnd.is_null() {
+                continue;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid != 0 && !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+    }
+    pids
+}
+
+fn process_name(pid: u32) -> String {
+    process_path(pid)
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| format!("PID {pid}"))
+}
+
+/// 被控端用：前台窗口或鼠标下的窗口属于权限比本程序高的程序（以管理员身份运行）时，返回程序名。
+/// 本程序注入的键鼠到不了这种窗口。
+pub fn elevated_target() -> Option<String> {
+    let me = integrity_level(unsafe { GetCurrentProcessId() }).unwrap_or(0x2000);
+    target_pids()
+        .into_iter()
+        .find(|&pid| integrity_level(pid).is_some_and(|level| level > me))
+        .map(process_name)
+}
+
+/// 当前输入桌面的名字：平时是 "Default"，锁屏 / UAC 弹窗时是 "Winlogon"。
+fn input_desktop_name() -> Option<String> {
+    unsafe {
+        let desk = OpenInputDesktop(0, 0, 0x0001); // DESKTOP_READOBJECTS
+        if desk.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 64];
+        let mut needed = 0u32;
+        let ok = GetUserObjectInformationW(
+            desk,
+            UOI_NAME,
+            buf.as_mut_ptr().cast(),
+            size_of_val(&buf) as u32,
+            &mut needed,
+        );
+        CloseDesktop(desk);
+        if ok == 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..len]))
+    }
+}
+
+/// 助手用：开关已打开、当前是普通桌面（不是 UAC 弹窗），而且前台窗口或鼠标下的窗口属于管理员程序。
+fn elevated_target_allowed() -> bool {
+    allow_elevated()
+        && input_desktop_name().is_some_and(|name| name.eq_ignore_ascii_case("Default"))
+        && target_pids()
+            .into_iter()
+            .any(|pid| integrity_level(pid).is_some_and(|level| level >= HIGH_INTEGRITY))
 }
 
 // ---------------------------------------------------------------- 服务主循环（SYSTEM，会话 0）
@@ -505,14 +695,7 @@ pub fn run_helper() -> Result<()> {
             let Ok(msg) = postcard::from_bytes::<HelperMsg>(&body) else {
                 continue;
             };
-            // 只在锁屏时注入；没锁屏时由被控端自己注入，UAC 弹窗一律不处理
-            if !session_locked(session) {
-                if matches!(msg, HelperMsg::ReleaseAll) {
-                    injector.release_all();
-                }
-                continue;
-            }
-            // 切到当前的输入桌面（锁屏界面在 Winlogon 桌面上）
+            // 切到当前的输入桌面（锁屏界面在 Winlogon 桌面上），后面判断窗口也要在这个桌面上做
             let input = unsafe { OpenInputDesktop(0, 0, GENERIC_ALL) };
             if !input.is_null() {
                 if unsafe { SetThreadDesktop(input) } != 0 {
@@ -523,6 +706,14 @@ pub fn run_helper() -> Result<()> {
                 } else {
                     unsafe { CloseDesktop(input) };
                 }
+            }
+            // 只在锁屏时、或者（用户打开了开关）目标是管理员程序时注入；其余由被控端自己注入，
+            // UAC 弹窗一律不处理
+            if !session_locked(session) && !elevated_target_allowed() {
+                if matches!(msg, HelperMsg::ReleaseAll) {
+                    injector.release_all();
+                }
+                continue;
             }
             match msg {
                 HelperMsg::MoveTo { x, y } => injector.move_to(x, y),
@@ -601,5 +792,34 @@ impl HelperLink {
             return false;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 列出所有窗口程序的完整性级别（只读，手动运行）：
+    /// `cargo test -p roam integrity_of_running_windows -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn integrity_of_running_windows() {
+        let me = integrity_level(unsafe { GetCurrentProcessId() });
+        println!("本进程: {me:x?}");
+        for p in std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-Process | Where-Object MainWindowHandle -ne 0 | ForEach-Object Id",
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u32>().ok())
+        {
+            println!("{:>24} {:x?}", process_name(p), integrity_level(p));
+        }
+        println!("允许控制管理员程序: {}", allow_elevated());
     }
 }
