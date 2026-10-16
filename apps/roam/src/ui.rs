@@ -4,7 +4,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
@@ -67,6 +67,11 @@ pub async fn serve(app: App, port: u16) -> Result<SocketAddr> {
         .route("/api/name", put(set_name))
         .route("/api/open-downloads", post(open_downloads))
         .route("/api/open-logs", post(open_logs))
+        .route("/api/context-menu", put(set_context_menu))
+        .route(
+            "/api/files/requests/{token}",
+            get(file_request).post(send_request),
+        )
         // 主机
         .route("/api/grid/{id}/{display}", put(move_display))
         .route("/api/peers", post(add_peer))
@@ -101,7 +106,7 @@ pub async fn serve(app: App, port: u16) -> Result<SocketAddr> {
     };
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, router).await {
+        if let Err(err) = axum::serve(listener, router.layer(Extension(addr.port()))).await {
             tracing::error!("界面服务退出: {err:#}");
         }
     });
@@ -175,6 +180,7 @@ struct ClientView {
 
 #[derive(Serialize)]
 struct StateView {
+    context_menu: bool,
     role: Role,
     id: String,
     name: String,
@@ -245,6 +251,7 @@ fn host_state(host: &Host) -> StateView {
     }));
 
     StateView {
+        context_menu: crate::send_menu::enabled(),
         role: Role::Host,
         id: host.host_id.clone(),
         name: config.name.clone(),
@@ -286,6 +293,7 @@ fn client_state(client: &Client) -> StateView {
     let pending = client.pending.lock().unwrap().clone();
     let status = client.status_text();
     StateView {
+        context_menu: crate::send_menu::enabled(),
         role: Role::Client,
         id: client.id.clone(),
         name: config.name.clone(),
@@ -364,6 +372,68 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 }
 
 type ApiResult<T = StatusCode> = Result<T, ApiError>;
+
+#[derive(Deserialize)]
+struct MenuBody {
+    enabled: bool,
+}
+
+async fn set_context_menu(
+    State(app): State<App>,
+    Extension(port): Extension<u16>,
+    Json(body): Json<MenuBody>,
+) -> ApiResult {
+    crate::send_menu::set_enabled(app.store(), port, body.enabled)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct FileRequestView {
+    names: Vec<String>,
+    targets: Vec<roam_proto::FileTarget>,
+}
+
+async fn file_request(
+    State(app): State<App>,
+    Path(token): Path<String>,
+) -> ApiResult<Json<FileRequestView>> {
+    let request = crate::send_menu::read(app.store(), &token)?;
+    let names = request
+        .paths
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    let targets = match &app {
+        App::Host(host) => host.file_targets(&host.host_id),
+        App::Client(client) => client.file_targets().await?,
+    };
+    Ok(Json(FileRequestView { names, targets }))
+}
+
+#[derive(Deserialize)]
+struct SendRequestBody {
+    target: String,
+}
+
+async fn send_request(
+    State(app): State<App>,
+    Path(token): Path<String>,
+    Json(body): Json<SendRequestBody>,
+) -> ApiResult {
+    let request = crate::send_menu::claim(app.store(), &token)?;
+    // 窗口关闭也让已确认的传输完成；成功删除请求，失败允许重试。
+    tokio::spawn(async move {
+        let result = match &app {
+            App::Host(host) => host.send_files(&body.target, request.paths).await,
+            App::Client(client) => client.send_files(&body.target, request.paths).await,
+        };
+        crate::send_menu::finish(app.store(), &token, result.is_ok())?;
+        result
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 // ---------------------------------------------------------------- 通用
 

@@ -3,6 +3,7 @@
 //! 文本和图片直接发过去；文件只宣告，对方按粘贴时再传（见 [`crate::pull`]）。
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -10,7 +11,8 @@ use std::{
 use anyhow::Result;
 use iroh::endpoint::Connection;
 use roam_proto::{
-    ClipboardData, ClipboardPolicy, FileAnnounce, FileDataHeader, FileOffer, FilePull, side,
+    ClipboardData, ClipboardPolicy, DirectFileOffer, FileAnnounce, FileCommand, FileDataHeader,
+    FileOffer, FilePull, side,
 };
 
 use crate::{
@@ -145,6 +147,8 @@ pub type OnFiles = Arc<dyn Fn(&[PathBuf], bool) -> bool + Send + Sync>;
 
 /// 接收对方发来的单向流的上下文。
 pub struct Inbound {
+    /// 仅主机可以列出组内设备、转发主动发送的文件。
+    pub file_host: Option<Arc<crate::host::Host>>,
     pub peer: String,
     /// 当前的同步策略（主机按设置计算，被控端用主机下发的）。
     pub policy: Arc<dyn Fn() -> ClipboardPolicy + Send + Sync>,
@@ -164,25 +168,66 @@ pub struct Inbound {
 }
 
 pub async fn receive_loop(conn: Connection, ctx: Inbound) {
+    receive_loop_in(conn, ctx, files::default_dir()).await;
+}
+
+pub(crate) async fn receive_loop_in(conn: Connection, ctx: Inbound, base: PathBuf) {
     let ctx = Arc::new(ctx);
+    let direct = Arc::new(Mutex::new(HashMap::<u64, Option<String>>::new()));
+    let rt = tokio::runtime::Handle::current();
     let receiver = {
         let ctx = ctx.clone();
-        Receiver::new(ctx.transfers.clone(), move |tops: Vec<PathBuf>| {
-            *ctx.last.lock().unwrap() = Some(files::digest(&tops));
-            let names: Vec<String> = tops
-                .iter()
-                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .collect();
-            tracing::info!("文件 ← {}：{}", ctx.peer, names.join("、"));
-            let on_files = ctx.on_files.clone();
-            std::thread::spawn(move || {
-                let ok = clipboard::with_clipboard(|cb| cb.set().file_list(&tops).is_ok())
-                    .unwrap_or(false);
-                if !on_files(&tops, ok) {
-                    notify_files_ready(&names, ok);
+        let direct = direct.clone();
+        let conn = conn.clone();
+        Receiver::new(
+            ctx.transfers.clone(),
+            base,
+            move |id, tops: Vec<PathBuf>| {
+                let route = direct.lock().unwrap().remove(&id);
+                if let Some(target) = route {
+                    let ctx = ctx.clone();
+                    let conn = conn.clone();
+                    rt.spawn(async move {
+                        let result = if let Some(target) = target {
+                            match &ctx.file_host {
+                                Some(host) => {
+                                    let result = host.send_files(&target, tops).await;
+                                    let _ =
+                                        tokio::fs::remove_dir_all(relay_dir(host, &conn, id)).await;
+                                    result
+                                }
+                                None => Err(anyhow::anyhow!("被控端不能转发文件")),
+                            }
+                        } else {
+                            let names = tops
+                                .iter()
+                                .filter_map(|p| {
+                                    p.file_name().map(|s| s.to_string_lossy().into_owned())
+                                })
+                                .collect::<Vec<_>>();
+                            notify_files_ready(&names, false);
+                            Ok(())
+                        };
+                        direct_result(&conn, id, result).await;
+                    });
+                    return;
                 }
-            });
-        })
+                *ctx.last.lock().unwrap() = Some(files::digest(&tops));
+                let names: Vec<String> = tops
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect();
+                tracing::info!("文件 ← {}：{}", ctx.peer, names.join("、"));
+                let on_files = ctx.on_files.clone();
+                std::thread::spawn(move || {
+                    let ok = clipboard::with_clipboard(|cb| cb.set().file_list(&tops).is_ok())
+                        .unwrap_or(false);
+                    if !on_files(&tops, ok) {
+                        notify_files_ready(&names, ok);
+                    }
+                });
+            },
+        )
     };
 
     while let Ok(mut stream) = conn.accept_uni().await {
@@ -196,6 +241,70 @@ pub async fn receive_loop(conn: Connection, ctx: Inbound) {
                 }
             };
         match kind {
+            side::FILE_COMMAND => {
+                if let Ok(command) = clipboard::decode::<FileCommand>(&body) {
+                    match command {
+                        FileCommand::List { request } => {
+                            if let Some(host) = &ctx.file_host {
+                                let targets = host.file_targets(&conn.remote_id().to_string());
+                                let _ = clipboard::send_side(
+                                    &conn,
+                                    side::FILE_COMMAND,
+                                    &FileCommand::Targets { request, targets },
+                                )
+                                .await;
+                            }
+                        }
+                        command => ctx.transfers.command(command),
+                    }
+                }
+            }
+            side::DIRECT_FILE_OFFER => {
+                let Ok(DirectFileOffer { offer, target }) =
+                    clipboard::decode::<DirectFileOffer>(&body)
+                else {
+                    continue;
+                };
+                let id = offer.transfer_id;
+                let validation = match &target {
+                    Some(target) if *target == conn.remote_id().to_string() => {
+                        Err(anyhow::anyhow!("不能把文件转发回发送者"))
+                    }
+                    Some(target) => match &ctx.file_host {
+                        Some(host) => host.check_file_target(target),
+                        None => Err(anyhow::anyhow!("被控端不能转发文件")),
+                    },
+                    None => Ok(()),
+                };
+                if let Err(err) = validation {
+                    direct_result(&conn, id, Err(err)).await;
+                    continue;
+                }
+                let base = target
+                    .as_ref()
+                    .and_then(|_| ctx.file_host.as_ref())
+                    .map(|host| relay_dir(host, &conn, id));
+                direct.lock().unwrap().insert(id, target);
+                let accepted = match &base {
+                    Some(base) => (|| {
+                        std::fs::create_dir_all(base)?;
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700))?;
+                        }
+                        receiver.on_offer_in(offer, &ctx.peer, policy.max_file_bytes, base)
+                    })(),
+                    None => receiver.on_offer(offer, &ctx.peer, policy.max_file_bytes),
+                };
+                if let Err(err) = accepted {
+                    direct.lock().unwrap().remove(&id);
+                    if let Some(base) = base {
+                        let _ = tokio::fs::remove_dir_all(base).await;
+                    }
+                    direct_result(&conn, id, Err(err)).await;
+                }
+            }
             side::CLIPBOARD_POLICY => {
                 if let (Some(on_policy), Ok(p)) =
                     (&ctx.on_policy, clipboard::decode::<ClipboardPolicy>(&body))
@@ -238,15 +347,43 @@ pub async fn receive_loop(conn: Connection, ctx: Inbound) {
                     continue;
                 };
                 let receiver = receiver.clone();
+                let conn = conn.clone();
+                let direct = direct.clone();
+                let host = ctx.file_host.clone();
                 tokio::spawn(async move {
+                    let id = header.transfer_id;
                     if let Err(err) = receiver.on_data(header, &mut stream).await {
                         tracing::warn!("接收文件失败: {err:#}");
+                        let route = direct.lock().unwrap().remove(&id);
+                        if let Some(target) = route {
+                            if target.is_some() {
+                                if let Some(host) = host {
+                                    let _ = tokio::fs::remove_dir_all(relay_dir(&host, &conn, id))
+                                        .await;
+                                }
+                            }
+                            direct_result(&conn, id, Err(err)).await;
+                        }
                     }
                 });
             }
             _ => {}
         }
     }
+}
+
+fn relay_dir(host: &crate::host::Host, conn: &Connection, id: u64) -> PathBuf {
+    host.store
+        .dir()
+        .join("file-forward")
+        .join(conn.remote_id().to_string())
+        .join(id.to_string())
+}
+
+async fn direct_result(conn: &Connection, id: u64, result: Result<()>) {
+    let error = result.err().map(|err| format!("{err:#}"));
+    let _ =
+        clipboard::send_side(conn, side::FILE_COMMAND, &FileCommand::Result { id, error }).await;
 }
 
 /// 文件收完后提醒用户可以粘贴了（Windows 弹出系统通知；macOS 在页面和菜单栏里显示）。

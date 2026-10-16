@@ -13,11 +13,18 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, ReadError, RecvStream, SendStream, VarInt};
-use roam_proto::{FileDataHeader, FileEntry, FileOffer, encode_side, side};
+use roam_proto::{
+    DirectFileOffer, FileCommand, FileDataHeader, FileEntry, FileOffer, FileTarget, encode_side,
+    side,
+};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
 const CHUNK: usize = 256 * 1024;
+
+pub fn supports_direct(version: &str) -> bool {
+    semver::Version::parse(version).is_ok_and(|v| v >= semver::Version::new(0, 3, 3))
+}
 
 /// 有文件读不了（例如 macOS 的隐私保护）。重试也没用，等剪贴板换了内容再发。
 #[derive(Debug)]
@@ -42,7 +49,7 @@ fn check_readable(entries: &[FileEntry], sources: &[PathBuf]) -> Result<()> {
             let hint = if cfg!(target_os = "macos")
                 && err.kind() == std::io::ErrorKind::PermissionDenied
             {
-                "。macOS 不允许 Roam 读取这个位置：在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里加入 Roam（从终端运行时加入终端），然后重新复制"
+                "。macOS 不允许 Roam 读取这个位置：在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里加入 Roam（从终端运行时加入终端），然后重试"
             } else {
                 ""
             };
@@ -75,9 +82,43 @@ pub struct TransferInfo {
 #[derive(Clone, Default)]
 pub struct Transfers {
     list: Arc<Mutex<Vec<TransferInfo>>>,
+    receipts: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<(), String>>>>>,
+    queries: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Vec<FileTarget>>>>>,
 }
 
 impl Transfers {
+    pub fn command(&self, command: FileCommand) {
+        match command {
+            FileCommand::Result { id, error } => {
+                if let Some(tx) = self.receipts.lock().unwrap().remove(&id) {
+                    let _ = tx.send(error.map_or(Ok(()), Err));
+                }
+            }
+            FileCommand::Targets { request, targets } => {
+                if let Some(tx) = self.queries.lock().unwrap().remove(&request) {
+                    let _ = tx.send(targets);
+                }
+            }
+            FileCommand::List { .. } => {}
+        }
+    }
+
+    pub async fn targets(&self, conn: &Connection) -> Result<Vec<FileTarget>> {
+        let request = new_id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.queries.lock().unwrap().insert(request, tx);
+        let result = async {
+            crate::clipboard::send_side(conn, side::FILE_COMMAND, &FileCommand::List { request })
+                .await?;
+            Ok(tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                .await
+                .context("主机没有响应，请升级主机 Roam 后重试")??)
+        }
+        .await;
+        self.queries.lock().unwrap().remove(&request);
+        result
+    }
+
     pub fn list(&self) -> Vec<TransferInfo> {
         self.list.lock().unwrap().clone()
     }
@@ -181,33 +222,44 @@ fn collect(paths: &[PathBuf]) -> Result<(Vec<FileEntry>, Vec<PathBuf>)> {
                 is_dir: true,
             });
             sources.push(src.to_path_buf());
-            let mut children: Vec<_> = std::fs::read_dir(src)?.filter_map(|e| e.ok()).collect();
+            let mut children: Vec<_> = std::fs::read_dir(src)?.collect::<std::io::Result<_>>()?;
             children.sort_by_key(|e| e.file_name());
             for child in children {
                 let name = child.file_name().to_string_lossy().into_owned();
                 walk(&child.path(), format!("{rel}/{name}"), entries, sources)?;
             }
-        } else {
+        } else if meta.is_file() {
             entries.push(FileEntry {
                 path: rel,
                 size: meta.len(),
                 is_dir: false,
             });
             sources.push(src.to_path_buf());
+        } else {
+            bail!("不支持的文件类型：{}", src.display());
         }
         Ok(())
     }
 
     let mut entries = Vec::new();
     let mut sources = Vec::new();
+    let mut names = HashSet::new();
     for p in paths {
         let name = p
             .file_name()
             .context("无效的文件路径")?
             .to_string_lossy()
             .into_owned();
+        anyhow::ensure!(
+            names.insert(name.clone()),
+            "选中的项目重名：{name}，请分开发送"
+        );
         walk(p, name, &mut entries, &mut sources)?;
     }
+    anyhow::ensure!(
+        !entries.is_empty(),
+        "没有可发送的普通文件或文件夹（不跟随符号链接）"
+    );
     Ok((entries, sources))
 }
 
@@ -218,6 +270,28 @@ pub async fn send(
     peer: &str,
     max_bytes: u64,
     transfers: &Transfers,
+) -> Result<()> {
+    send_inner(conn, paths, peer, max_bytes, transfers, None).await
+}
+
+pub async fn send_direct(
+    conn: &Connection,
+    paths: Vec<PathBuf>,
+    peer: &str,
+    max_bytes: u64,
+    transfers: &Transfers,
+    target: Option<String>,
+) -> Result<()> {
+    send_inner(conn, paths, peer, max_bytes, transfers, Some(target)).await
+}
+
+async fn send_inner(
+    conn: &Connection,
+    paths: Vec<PathBuf>,
+    peer: &str,
+    max_bytes: u64,
+    transfers: &Transfers,
+    direct: Option<Option<String>>,
 ) -> Result<()> {
     let (entries, sources) = tokio::task::spawn_blocking(move || {
         let (entries, sources) = collect(&paths)?;
@@ -238,6 +312,11 @@ pub async fn send(
         );
     }
     let id = offer.transfer_id;
+    let receipt = direct.as_ref().map(|_| {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        transfers.receipts.lock().unwrap().insert(id, tx);
+        rx
+    });
     transfers.start(TransferInfo {
         id,
         direction: "send",
@@ -252,7 +331,20 @@ pub async fn send(
     });
 
     let result = async {
-        crate::clipboard::send_side(conn, side::FILE_OFFER, &offer).await?;
+        match direct {
+            Some(target) => {
+                crate::clipboard::send_side(
+                    conn,
+                    side::DIRECT_FILE_OFFER,
+                    &DirectFileOffer {
+                        offer: offer.clone(),
+                        target,
+                    },
+                )
+                .await?
+            }
+            None => crate::clipboard::send_side(conn, side::FILE_OFFER, &offer).await?,
+        }
         for (index, (entry, src)) in offer.entries.iter().zip(&sources).enumerate() {
             if entry.is_dir || entry.size == 0 {
                 continue;
@@ -269,10 +361,19 @@ pub async fn send(
             }
             sent?;
         }
+        if let Some(receipt) = receipt {
+            tokio::select! {
+                result = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), receipt) => {
+                    result.context("等待接收端保存文件超时")??.map_err(anyhow::Error::msg)?;
+                }
+                _ = conn.closed() => bail!("接收电脑已断开连接，未确认文件保存完成"),
+            }
+        }
         anyhow::Ok(())
     }
     .await;
 
+    transfers.receipts.lock().unwrap().remove(&id);
     transfers.update(id, |t| match &result {
         Ok(()) => t.state = "done",
         Err(err) => {
@@ -333,7 +434,7 @@ pub struct Receiver {
     transfers: Transfers,
     incoming: Arc<Mutex<HashMap<u64, Incoming>>>,
     /// 全部完成时回调：顶层路径。
-    on_complete: Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>,
+    on_complete: Arc<dyn Fn(u64, Vec<PathBuf>) + Send + Sync>,
 }
 
 /// 默认接收目录：下载/Roam。
@@ -347,10 +448,11 @@ pub fn default_dir() -> PathBuf {
 impl Receiver {
     pub fn new(
         transfers: Transfers,
-        on_complete: impl Fn(Vec<PathBuf>) + Send + Sync + 'static,
+        base: PathBuf,
+        on_complete: impl Fn(u64, Vec<PathBuf>) + Send + Sync + 'static,
     ) -> Self {
         Self {
-            base: default_dir(),
+            base,
             transfers,
             incoming: Arc::new(Mutex::new(HashMap::new())),
             on_complete: Arc::new(on_complete),
@@ -358,31 +460,72 @@ impl Receiver {
     }
 
     pub fn on_offer(&self, offer: FileOffer, peer: &str, max_bytes: u64) -> Result<()> {
+        self.on_offer_in(offer, peer, max_bytes, &self.base)
+    }
+
+    pub fn on_offer_in(
+        &self,
+        offer: FileOffer,
+        peer: &str,
+        max_bytes: u64,
+        base: &Path,
+    ) -> Result<()> {
         let total = offer.total_bytes();
         if total > max_bytes {
             bail!("对方发来的文件 {} 超过上限，已拒收", human_bytes(total));
         }
-        std::fs::create_dir_all(&self.base)?;
+        anyhow::ensure!(!offer.entries.is_empty(), "文件清单为空");
+        anyhow::ensure!(
+            !self
+                .incoming
+                .lock()
+                .unwrap()
+                .contains_key(&offer.transfer_id),
+            "重复的传输编号"
+        );
+        std::fs::create_dir_all(base)?;
 
         // 顶层名字和本地已有文件重名时自动改名：报告.pdf → 报告 (1).pdf
         let mut renamed: HashMap<String, String> = HashMap::new();
         let mut tops = Vec::new();
         for entry in &offer.entries {
             let top = entry.path.split('/').next().unwrap_or_default().to_string();
-            if top.is_empty() || renamed.contains_key(&top) {
+            anyhow::ensure!(!top.is_empty(), "非法的文件路径");
+            if renamed.contains_key(&top) {
                 continue;
             }
-            let unique = unique_name(&self.base, &sanitize(&top));
-            tops.push(self.base.join(&unique));
+            let sanitized = sanitize(&top);
+            anyhow::ensure!(!sanitized.is_empty(), "非法的文件名");
+            // 先独占顶层目标，防止两个并行传输选中同一个名字后互相覆盖。
+            let unique = loop {
+                let candidate = unique_name(base, &sanitized);
+                let path = base.join(&candidate);
+                let reserved = if entry.is_dir {
+                    std::fs::create_dir(&path)
+                } else {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .map(|_| ())
+                };
+                match reserved {
+                    Ok(()) => break candidate,
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => return Err(err.into()),
+                }
+            };
+            tops.push(base.join(&unique));
             renamed.insert(top, unique);
         }
 
         let mut targets = Vec::with_capacity(offer.entries.len());
         let mut pending = HashSet::new();
+        let mut used_paths = HashSet::new();
         for (index, entry) in offer.entries.iter().enumerate() {
             let mut parts = entry.path.split('/');
             let top = parts.next().unwrap_or_default();
-            let mut path = self.base.join(&renamed[top]);
+            let mut path = base.join(&renamed[top]);
             for part in parts {
                 let part = sanitize(part);
                 if part.is_empty() || part == "." || part == ".." {
@@ -390,15 +533,24 @@ impl Receiver {
                 }
                 path.push(part);
             }
+            anyhow::ensure!(
+                used_paths.insert(path.to_string_lossy().to_lowercase()),
+                "清单中的文件名重复：{}",
+                entry.path
+            );
             if entry.is_dir {
                 std::fs::create_dir_all(&path)?;
             } else {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                if entry.size == 0 {
-                    std::fs::File::create(&path)?;
-                } else {
+                if path != base.join(&renamed[top]) {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?;
+                }
+                if entry.size != 0 {
                     pending.insert(index as u32);
                 }
             }
@@ -416,7 +568,7 @@ impl Receiver {
             done: 0,
             state: "running",
             error: None,
-            location: Some(self.base.display().to_string()),
+            location: Some(base.display().to_string()),
         });
         let done_now = pending.is_empty();
         self.incoming.lock().unwrap().insert(
@@ -448,12 +600,15 @@ impl Receiver {
             (t.targets[header.index as usize].clone(), entry.size)
         };
 
-        let part = target.with_file_name(format!(
-            "{}.part",
-            target.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        let part = target.with_file_name(format!(".roam-{id:016x}-{:08x}.part", header.index));
+        let mut created = false;
         let result = async {
-            let mut file = tokio::fs::File::create(&part).await?;
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&part)
+                .await?;
+            created = true;
             let mut received = 0u64;
             let mut buf = vec![0u8; CHUNK];
             loop {
@@ -483,7 +638,9 @@ impl Receiver {
         .await;
 
         if let Err(err) = result {
-            let _ = tokio::fs::remove_file(&part).await;
+            if created {
+                let _ = tokio::fs::remove_file(&part).await;
+            }
             self.fail(id, &err);
             return Err(err);
         }
@@ -504,7 +661,7 @@ impl Receiver {
             return;
         };
         self.transfers.update(id, |t| t.state = "done");
-        (self.on_complete)(incoming.tops);
+        (self.on_complete)(id, incoming.tops);
     }
 
     fn fail(&self, id: u64, err: &anyhow::Error) {
@@ -620,5 +777,33 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KB");
         assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GB");
+    }
+
+    #[test]
+    fn concurrent_offers_reserve_separate_destinations() {
+        let dir = std::env::temp_dir().join(format!("roam-reserve-{}", new_id()));
+        let a = Receiver::new(Transfers::default(), dir.clone(), |_, _| {});
+        let b = Receiver::new(Transfers::default(), dir.clone(), |_, _| {});
+        for (receiver, id) in [(&a, 1), (&b, 2)] {
+            receiver
+                .on_offer(
+                    FileOffer {
+                        transfer_id: id,
+                        entries: vec![FileEntry {
+                            path: "same.txt".into(),
+                            size: 1,
+                            is_dir: false,
+                        }],
+                    },
+                    "peer",
+                    1024,
+                )
+                .unwrap();
+        }
+        let left = a.incoming.lock().unwrap()[&1].tops[0].clone();
+        let right = b.incoming.lock().unwrap()[&2].tops[0].clone();
+        assert_ne!(left, right);
+        assert!(left.exists() && right.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

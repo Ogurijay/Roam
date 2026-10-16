@@ -63,6 +63,48 @@ pub struct Client {
 }
 
 impl Client {
+    fn file_connection(&self) -> Result<(ConnectedHost, Connection)> {
+        let host = self
+            .host
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("主机未连接"))?;
+        let conn = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&host.id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("主机已断开连接"))?;
+        Ok((host, conn))
+    }
+
+    pub async fn file_targets(&self) -> Result<Vec<roam_proto::FileTarget>> {
+        let (host, conn) = self.file_connection()?;
+        if !files::supports_direct(&host.version) {
+            return Ok(vec![roam_proto::FileTarget {
+                id: host.id,
+                name: host.name,
+                ready: false,
+            }]);
+        }
+        self.transfers.targets(&conn).await
+    }
+
+    pub async fn send_files(&self, target: &str, paths: Vec<std::path::PathBuf>) -> Result<()> {
+        let targets = self.file_targets().await?;
+        let dest = targets
+            .into_iter()
+            .find(|t| t.id == target)
+            .ok_or_else(|| anyhow::anyhow!("目标电脑不在线"))?;
+        anyhow::ensure!(dest.ready, "请先将目标电脑更新到 Roam v0.3.3 或更新版本");
+        let (host, conn) = self.file_connection()?;
+        let max = self.store.load()?.clipboard.max_file_bytes();
+        let route = (target != host.id).then(|| target.to_string());
+        files::send_direct(&conn, paths, &dest.name, max, &self.transfers, route).await
+    }
+
     pub async fn start(store: Store) -> Result<Arc<Self>> {
         if !roam_input::CAN_INJECT {
             bail!("这个系统暂不支持作为被控端");
@@ -407,6 +449,7 @@ impl Client {
         let shelf = Arc::new(Shelf::default());
         let side_task = {
             let ctx = Inbound {
+                file_host: None,
                 peer: host.name.clone(),
                 policy: {
                     let policy = policy.clone();
@@ -542,9 +585,12 @@ impl Client {
                 {
                     let mut inj = injector.lock().unwrap();
                     match msg {
-                        StreamMsg::Enter { x, y } | StreamMsg::MouseTo { x, y } => {
+                        StreamMsg::Enter { x, y } => {
+                            // 只有实际切入才唤醒显示器；后台连接和心跳不应点亮屏幕。
+                            roam_input::power::declare_user_active();
                             inj.move_to(x, y)
                         }
+                        StreamMsg::MouseTo { x, y } => inj.move_to(x, y),
                         StreamMsg::Leave | StreamMsg::ReleaseAll => {
                             keys.reset();
                             inj.release_all()

@@ -262,6 +262,39 @@ pub mod side {
     pub const FILE_ANNOUNCE: u8 = 5;
     /// 用户在本机按了粘贴，请对方把宣告过的文件发过来：[`FilePull`](super::FilePull)。
     pub const FILE_PULL: u8 = 6;
+    /// 用户主动发送文件；不改写接收端剪贴板。
+    pub const DIRECT_FILE_OFFER: u8 = 7;
+    pub const FILE_COMMAND: u8 = 8;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTarget {
+    pub id: String,
+    pub name: String,
+    pub ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectFileOffer {
+    pub offer: FileOffer,
+    /// None 表示交给接收方；Some 表示请主机转发给指定被控端。
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileCommand {
+    List {
+        request: u64,
+    },
+    Targets {
+        request: u64,
+        targets: Vec<FileTarget>,
+    },
+    /// 接收端（转发时为最终接收端）已经保存完文件。
+    Result {
+        id: u64,
+        error: Option<String>,
+    },
 }
 
 /// 剪贴板内容。有文本时只同步文本（和富文本），没有文本时才同步图片。

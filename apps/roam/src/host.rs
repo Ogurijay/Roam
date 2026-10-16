@@ -108,6 +108,57 @@ pub struct Host {
 }
 
 impl Host {
+    /// 主机可向在线被控端发送；被控端查询时也包含主机本身。
+    pub fn file_targets(&self, exclude: &str) -> Vec<roam_proto::FileTarget> {
+        let config = self.config.lock().unwrap();
+        let status = self.status.lock().unwrap();
+        let mut targets = Vec::new();
+        if exclude != self.host_id {
+            targets.push(roam_proto::FileTarget {
+                id: self.host_id.clone(),
+                name: config.name.clone(),
+                ready: true,
+            });
+        }
+        targets.extend(config.peers.iter().filter_map(|p| {
+            let s = status.get(&p.id)?;
+            (p.id != exclude && s.online && !s.stalled).then(|| roam_proto::FileTarget {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                ready: files::supports_direct(s.version.as_deref().unwrap_or("")),
+            })
+        }));
+        targets
+    }
+
+    pub fn check_file_target(&self, target: &str) -> anyhow::Result<()> {
+        let target = self
+            .file_targets(&self.host_id)
+            .into_iter()
+            .find(|t| t.id == target)
+            .context("目标电脑不在线")?;
+        anyhow::ensure!(
+            target.ready,
+            "请先将「{}」更新到 Roam v0.3.3 或更新版本",
+            target.name
+        );
+        Ok(())
+    }
+
+    pub async fn send_files(&self, target: &str, paths: Vec<PathBuf>) -> anyhow::Result<()> {
+        self.check_file_target(target)?;
+        let conn = self
+            .conns
+            .lock()
+            .unwrap()
+            .get(target)
+            .cloned()
+            .context("目标电脑已断开连接")?;
+        let name = self.peer_name(target);
+        let max = self.config.lock().unwrap().clipboard.max_file_bytes();
+        files::send_direct(&conn, paths, &name, max, &self.transfers, None).await
+    }
+
     pub fn new(
         store: Store,
         endpoint: Endpoint,
@@ -655,6 +706,7 @@ impl Host {
             let id = peer.id.clone();
             let rt = tokio::runtime::Handle::current();
             let ctx = Inbound {
+                file_host: Some(host.clone()),
                 peer: hello.name.clone(),
                 policy: {
                     let host = host.clone();
@@ -1348,4 +1400,200 @@ impl Drop for AbortOnDrop {
 
 fn short_id(id: &str) -> &str {
     &id[..id.len().min(10)]
+}
+
+#[cfg(test)]
+mod file_send_tests {
+    use super::*;
+    use crate::sync::{Inbound, LastDigest};
+    use iroh::{EndpointAddr, endpoint::presets};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct NoCursor;
+    impl CursorControl for NoCursor {
+        fn hide(&mut self) {}
+        fn show(&mut self) {}
+        fn warp(&mut self, _: f64, _: f64) {}
+        fn set_locked(&mut self, _: bool) {}
+    }
+
+    async fn endpoint() -> Endpoint {
+        Endpoint::builder(presets::Minimal)
+            .alpns(vec![roam_proto::ALPN.to_vec()])
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    async fn pair(a: &Endpoint, b: &Endpoint) -> (Connection, Connection) {
+        let addr = EndpointAddr::new(b.id()).with_ip_addr(b.bound_sockets()[0]);
+        let (a, b) = tokio::join!(a.connect(addr, roam_proto::ALPN), async {
+            b.accept().await.unwrap().await.unwrap()
+        });
+        (a.unwrap(), b)
+    }
+
+    fn inbound(host: Option<Arc<Host>>, transfers: Transfers, limit: Arc<AtomicU64>) -> Inbound {
+        Inbound {
+            file_host: host,
+            peer: "test".into(),
+            // 主动发送应独立于剪贴板开关，且不能调用剪贴板回调。
+            policy: Arc::new(move || ClipboardPolicy {
+                max_file_bytes: limit.load(Ordering::Relaxed),
+                ..Default::default()
+            }),
+            on_policy: None,
+            last: LastDigest::default(),
+            transfers,
+            on_updated: Arc::new(|| panic!("explicit send changed clipboard")),
+            on_announce: Arc::new(|_| panic!("unexpected clipboard announcement")),
+            on_pull: Arc::new(|_| panic!("unexpected clipboard pull")),
+            on_files: Arc::new(|_, _| panic!("explicit send changed clipboard")),
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_multiselect_through_host_and_confirms_final_save() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let root = std::env::temp_dir().join(format!("roam-direct-{}", files::new_id()));
+            let store = Store::open(Some(root.join("host"))).unwrap();
+            let (a, h, b) = (endpoint().await, endpoint().await, endpoint().await);
+            let (ah, ha) = pair(&a, &h).await;
+            let (hb, bh) = pair(&h, &b).await;
+            let host = Host::new(store, h.clone(), Box::new(NoCursor)).unwrap();
+            for (endpoint, conn) in [(&a, ha.clone()), (&b, hb.clone())] {
+                let id = endpoint.id().to_string();
+                host.config
+                    .lock()
+                    .unwrap()
+                    .peers
+                    .push(roam_core::config::Peer {
+                        id: id.clone(),
+                        ticket: String::new(),
+                        name: id.clone(),
+                        os: None,
+                        displays: vec![],
+                        settings: Default::default(),
+                    });
+                host.status.lock().unwrap().insert(
+                    id.clone(),
+                    PeerStatus {
+                        online: true,
+                        version: Some(roam_proto::VERSION.into()),
+                        ..Default::default()
+                    },
+                );
+                host.conns.lock().unwrap().insert(id, conn);
+            }
+            let limit = Arc::new(AtomicU64::new(1 << 24));
+            let transfers = Transfers::default();
+            let receive = Transfers::default();
+            let tasks = [
+                tokio::spawn(sync::receive_loop_in(
+                    ah.clone(),
+                    inbound(None, transfers.clone(), limit.clone()),
+                    root.join("a"),
+                )),
+                tokio::spawn(sync::receive_loop_in(
+                    ha,
+                    inbound(Some(host.clone()), host.transfers.clone(), limit.clone()),
+                    root.join("h"),
+                )),
+                tokio::spawn(sync::receive_loop_in(
+                    hb,
+                    inbound(Some(host.clone()), host.transfers.clone(), limit.clone()),
+                    root.join("h"),
+                )),
+                tokio::spawn(sync::receive_loop_in(
+                    bh,
+                    inbound(None, receive.clone(), limit.clone()),
+                    root.join("b"),
+                )),
+            ];
+            let targets = transfers.targets(&ah).await.unwrap();
+            assert!(targets.iter().any(|t| t.id == h.id().to_string()));
+            assert!(
+                targets
+                    .iter()
+                    .any(|t| t.id == b.id().to_string() && t.ready)
+            );
+            assert!(!targets.iter().any(|t| t.id == a.id().to_string()));
+            let source = root.join("source");
+            std::fs::create_dir_all(source.join("项目/空目录")).unwrap();
+            std::fs::create_dir_all(root.join("b")).unwrap();
+            std::fs::write(source.join("项目/中文 空格 ' $().txt"), vec![42; 600_000]).unwrap();
+            std::fs::write(source.join("项目/empty.txt"), b"").unwrap();
+            std::fs::write(source.join("项目/packet"), vec![5; 300_000]).unwrap();
+            std::fs::write(source.join("项目/packet.part"), b"keep separate").unwrap();
+            std::fs::write(source.join("报告.txt"), b"new").unwrap();
+            std::fs::write(root.join("b/报告.txt"), b"original").unwrap();
+            let paths = vec![source.join("项目"), source.join("报告.txt")];
+            files::send_direct(
+                &ah,
+                paths.clone(),
+                "b",
+                1 << 24,
+                &transfers,
+                Some(b.id().to_string()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(root.join("b/报告.txt")).unwrap(), b"original");
+            assert_eq!(std::fs::read(root.join("b/报告 (1).txt")).unwrap(), b"new");
+            assert_eq!(
+                std::fs::read(root.join("b/项目/中文 空格 ' $().txt")).unwrap(),
+                vec![42; 600_000]
+            );
+            assert!(root.join("b/项目/空目录").is_dir());
+            assert!(root.join("b/项目/empty.txt").is_file());
+            assert_eq!(
+                std::fs::read(root.join("b/项目/packet")).unwrap(),
+                vec![5; 300_000]
+            );
+            assert_eq!(
+                std::fs::read(root.join("b/项目/packet.part")).unwrap(),
+                b"keep separate"
+            );
+            assert_eq!(transfers.list()[0].state, "done");
+            assert_eq!(receive.list()[0].state, "done");
+            let cache = host
+                .store
+                .dir()
+                .join("file-forward")
+                .join(a.id().to_string());
+            assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
+            assert!(
+                files::send_direct(
+                    &ah,
+                    paths.clone(),
+                    "missing",
+                    1 << 24,
+                    &transfers,
+                    Some("missing".into())
+                )
+                .await
+                .is_err()
+            );
+            limit.store(1, Ordering::Relaxed);
+            assert!(
+                files::send_direct(&ah, paths, "h", 1 << 24, &transfers, None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(transfers.list()[0].state, "failed");
+            for task in tasks {
+                task.abort();
+            }
+            a.close().await;
+            h.close().await;
+            b.close().await;
+            drop(host);
+            std::fs::remove_dir_all(root).unwrap();
+        })
+        .await
+        .expect("local file transfer timed out");
+    }
 }

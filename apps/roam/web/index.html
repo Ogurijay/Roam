@@ -261,10 +261,32 @@
   <button data-tab="clipboard" data-host>剪贴板</button>
   <button data-tab="hotkeys" data-host>快捷键</button>
   <button data-tab="updates">更新</button>
+  <button data-tab="files">发送文件</button>
   <button data-tab="logs">日志</button>
 </nav>
 
 <main>
+  <div class="card" id="sendPanel" hidden>
+    <h3>发送到其他电脑</h3>
+    <p id="sendNames" style="overflow-wrap:anywhere"></p>
+    <label for="sendTarget">接收电脑</label>
+    <div class="row" style="margin-top:8px">
+      <select id="sendTarget" class="grow"></select>
+      <button id="sendFiles" class="primary">发送</button>
+      <button id="cancelSend">取消</button>
+    </div>
+    <p id="sendHint" class="muted small" role="status" aria-live="polite"></p>
+  </div>
+  <section class="tab" data-panel="files">
+    <div class="card">
+      <h3>右键发送文件</h3>
+      <p id="menuHelp"></p>
+      <p class="muted small">支持多选文件和文件夹。选择接收电脑后立即发送，收到的文件保存在「下载/Roam」，同名文件会另存。被控端之间通过主机转发；双方和主机均需 Roam v0.3.3 或更新版本。</p>
+      <button id="contextMenu">添加右键菜单</button>
+      <button data-open-downloads>打开接收文件夹</button>
+      <p id="menuStatus" class="muted small" role="status"></p>
+    </div>
+  </section>
   <!-- ============ 设备：主机 ============ -->
   <section class="tab active" data-panel="devices" id="hostDevices" hidden>
     <div class="devices">
@@ -515,7 +537,76 @@ function render() {
 
   if (isHost) renderHost(); else renderClient();
   renderTransfers(isHost ? 'transferList' : 'clientTransferList', isHost ? 'transferCard' : 'clientTransferCard');
+  $('contextMenu').textContent = state.context_menu ? '移除右键菜单' : '添加右键菜单';
+  $('menuStatus').textContent = state.context_menu ? '已添加到当前用户的右键菜单' : '尚未添加右键菜单';
+  $('menuHelp').textContent = state.os === 'Windows'
+    ? '在资源管理器中选中文件，右键 → 发送到 → Roam - 发送到其他电脑。Windows 11 可能需要先点「显示更多选项」。'
+    : '在 Finder 中选中文件，右键 → Roam - 发送到其他电脑；部分系统版本会放在「快速操作」或「服务」中。';
 }
+
+let sendToken = '', sending = false, loadingRequest = false, sendError = '';
+function readSendToken() {
+  sendToken = /^#send=([a-f0-9]{64})$/i.exec(location.hash)?.[1] || '';
+  $('sendPanel').hidden = !sendToken;
+  if (sendToken) {
+    sendError = ''; $('sendFiles').textContent = '发送'; $('sendFiles').disabled = true;
+    $('sendNames').textContent = '正在读取选中的文件…';
+    switchTab('files'); loadSendRequest();
+  }
+}
+async function loadSendRequest() {
+  if (!sendToken || sending || loadingRequest) return;
+  loadingRequest = true;
+  try {
+    const request = await api('GET', `/api/files/requests/${sendToken}`);
+    $('sendNames').textContent = request.names.join('、');
+    const selected = $('sendTarget').value;
+    const ready = request.targets.some(t => t.ready);
+    const placeholder = ready ? '请选择接收电脑' : request.targets.length ? '在线电脑需要先升级 Roam' : '暂无在线电脑';
+    setHtml($('sendTarget'), `<option value="" disabled>${placeholder}</option>` + request.targets.map(t => `<option value="${esc(t.id)}" ${t.ready ? '' : 'disabled'}>${esc(t.name)}${t.ready ? '' : '（需要升级）'}</option>`).join(''));
+    if (request.targets.some(t => t.id === selected && t.ready)) $('sendTarget').value = selected;
+    else $('sendTarget').value = request.targets.find(t => t.ready)?.id || '';
+    $('sendFiles').disabled = !$('sendTarget').value;
+    $('sendHint').textContent = sendError || (!request.targets.length
+      ? '没有在线的接收电脑，请先在 Roam 中连接设备。'
+      : !ready ? '在线电脑仍在运行旧版 Roam，请先升级到 v0.3.3 或更新版本。'
+      : '选择接收电脑。接收端保存完成后会显示发送成功；灰色电脑需要先升级。');
+  } catch (err) {
+    $('sendHint').textContent = err.message;
+    $('sendFiles').disabled = true;
+  } finally { loadingRequest = false; }
+}
+$('sendFiles').addEventListener('click', async () => {
+  if (sending || !$('sendTarget').value) return;
+  sendError = '';
+  sending = true; $('sendFiles').disabled = true; $('sendTarget').disabled = true; $('cancelSend').disabled = true;
+  $('sendHint').textContent = '正在发送，可在「设备」页查看进度。关闭此窗口不会取消传输。';
+  try {
+    await api('POST', `/api/files/requests/${sendToken}`, { target: $('sendTarget').value });
+    $('sendHint').textContent = '发送成功，接收电脑已保存到「下载/Roam」。';
+    toast('文件发送成功');
+    sendToken = ''; history.replaceState(null, '', location.pathname); $('sendFiles').textContent = '已发送';
+  } catch (err) {
+    sendError = err.message;
+    $('sendHint').textContent = err.message;
+    $('sendFiles').disabled = false;
+  } finally {
+    sending = false; $('sendTarget').disabled = false; $('cancelSend').disabled = false;
+  }
+});
+$('sendTarget').addEventListener('change', () => { sendError = ''; });
+$('cancelSend').addEventListener('click', () => {
+  sendToken = ''; history.replaceState(null, '', location.pathname); $('sendPanel').hidden = true;
+});
+$('contextMenu').addEventListener('click', async () => {
+  $('contextMenu').disabled = true;
+  try { await api('PUT', '/api/context-menu', { enabled: !state.context_menu }); await refresh(); }
+  catch (err) { toast(err.message); }
+  finally { $('contextMenu').disabled = false; }
+});
+window.addEventListener('hashchange', readSendToken);
+readSendToken();
+setInterval(loadSendRequest, 2500);
 
 function setStatus(text, kind) {
   const pill = $('statusPill');

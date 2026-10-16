@@ -21,6 +21,7 @@ mod host;
 mod logging;
 mod pairing;
 mod pull;
+mod send_menu;
 mod sync;
 mod tray;
 mod ui;
@@ -69,6 +70,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// 从文件管理器发送文件：打开在线设备选择窗口
+    Send {
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
+    },
+    /// 安装或移除文件管理器的右键菜单（当前用户，无需管理员权限）
+    ContextMenu {
+        #[arg(value_parser = ["install", "uninstall"])]
+        action: String,
+    },
     /// 作为主机运行：用本机键鼠控制其他设备
     Host {
         /// 演示：被控端上线后，自动把光标移过去画一圈再回来（用于验证链路）
@@ -119,9 +130,29 @@ fn main() -> Result<()> {
     if let Some(Cmd::Service { .. } | Cmd::InputHelper { .. }) = &cli.cmd {
         return run_system_component(cli.cmd.expect("checked above"));
     }
-    update::cleanup_old();
     let store = Store::open(cli.config_dir.clone())?;
+    let command_result = match &cli.cmd {
+        Some(Cmd::Send { paths }) => Some(send_menu::open(&store, cli.ui_port, paths)),
+        Some(Cmd::ContextMenu { action }) => Some(send_menu::set_enabled(
+            &store,
+            cli.ui_port,
+            action == "install",
+        )),
+        _ => None,
+    };
+    if let Some(result) = command_result {
+        if let Err(err) = &result {
+            dialog::alert("Roam", &format!("{err:#}"));
+        }
+        return result;
+    }
+    update::cleanup_old();
     logging::init(&store.dir().join("logs"));
+    if cli.config_dir.is_none() && send_menu::enabled() {
+        if let Err(err) = send_menu::set_enabled(&store, cli.ui_port, true) {
+            tracing::warn!("刷新右键菜单失败: {err:#}");
+        }
+    }
 
     let mut relaunch_args = Vec::new();
     if let Some(dir) = &cli.config_dir {
@@ -139,7 +170,12 @@ fn main() -> Result<()> {
         Some(Cmd::Add { ticket, name }) => return add(store, ticket, name.clone()),
         Some(Cmd::Host { demo }) => (Role::Host, *demo),
         Some(Cmd::Client) => (Role::Client, false),
-        Some(Cmd::Service { .. } | Cmd::InputHelper { .. }) => unreachable!("handled above"),
+        Some(
+            Cmd::Service { .. }
+            | Cmd::InputHelper { .. }
+            | Cmd::Send { .. }
+            | Cmd::ContextMenu { .. },
+        ) => unreachable!("handled above"),
         None => (store.load()?.role(), false),
     };
     // 常驻后台也要保持实时响应（关闭 App Nap / 后台节能）
