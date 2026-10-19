@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     layout::Cell,
-    settings::{ClipboardSettings, DeviceSettings, SwitchSettings},
+    settings::{ClipboardSettings, DeviceSettings, InputSettings, SwitchSettings},
 };
 
 /// 本机的角色。
@@ -46,6 +46,8 @@ pub struct Peer {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub input: InputSettings,
     pub name: String,
     /// 主机：要控制的设备。
     #[serde(default)]
@@ -83,6 +85,7 @@ fn default_true() -> bool {
 impl Config {
     fn new_default() -> Self {
         Self {
+            input: InputSettings::default(),
             name: default_device_name(),
             peers: Vec::new(),
             trusted_hosts: Vec::new(),

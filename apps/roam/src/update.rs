@@ -3,7 +3,7 @@
 //! - 新版本由 GitHub Actions 构建并发布到 GitHub Releases（见 `.github/workflows/release.yml`）
 //! - 主机定期检查，提示后一键更新：主机下载各平台安装包，通过更新通道
 //!   （[`UPDATE_ALPN`]，永远兼容）推送给被控端，最后更新自己
-//! - 被控端只接受已授权主机推送的更新，并校验 SHA256
+//! - 被控端也可自行从 GitHub 检查更新；主机推送仍要求授权，所有下载均校验 SHA256
 
 use std::{
     io::Write,
@@ -226,6 +226,23 @@ impl Updater {
     /// 指定版本的发布信息（同步旧设备到主机当前版本时用）。
     pub async fn release_for(&self, version: &str) -> Result<Release> {
         self.get_release(&format!("releases/tags/v{version}")).await
+    }
+
+    /// 仅准备本机的新版本，不依赖主机连接，也不降级本机。
+    pub async fn prepare_self_update(&self, mirror: Option<&str>) -> Result<Option<PathBuf>> {
+        self.set_error(None);
+        self.set_phase(Some("正在检查更新…".into()));
+        if !self.check().await? {
+            return Ok(None);
+        }
+        let release = self
+            .state
+            .lock()
+            .unwrap()
+            .latest
+            .clone()
+            .context("没有可用的版本")?;
+        self.fetch(&release, Os::current(), mirror).await.map(Some)
     }
 
     /// 下载某个平台的安装包并校验 SHA256，已经下载过就直接用缓存。
@@ -614,6 +631,86 @@ pub async fn receive(conn: Connection, trusted: bool, staging: PathBuf) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bad_download_preserves_cache_and_valid_retry_succeeds() {
+        use axum::{Router, routing::get};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let valid = Arc::new(AtomicBool::new(false));
+        let payload = b"verified executable bytes";
+        let hash = Sha256::digest(payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let os = Os::Windows;
+        let name = asset_name(os).unwrap();
+        let sums = format!("{hash}  {name}\n");
+        let flag = valid.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/sums", get(move || async move { sums }))
+                    .route(
+                        "/bin",
+                        get(move || {
+                            let flag = flag.clone();
+                            async move {
+                                if flag.load(Ordering::Relaxed) {
+                                    payload.as_slice()
+                                } else {
+                                    b"corrupt bytes".as_slice()
+                                }
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let dir = TestDir::new();
+        let updater = Updater::new(&endpoint, dir.0.clone()).unwrap();
+        let release = Release {
+            version: "9.0.0".into(),
+            notes: String::new(),
+            url: base.clone(),
+            assets: vec![
+                Asset {
+                    name: name.into(),
+                    url: format!("{base}/bin"),
+                    size: payload.len() as u64,
+                },
+                Asset {
+                    name: CHECKSUMS.into(),
+                    url: format!("{base}/sums"),
+                    size: 0,
+                },
+            ],
+        };
+        let cached = dir.0.join("9.0.0").join(name);
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, b"previous cached bytes").unwrap();
+        assert!(updater.fetch(&release, os, None).await.is_err());
+        assert_eq!(std::fs::read(&cached).unwrap(), b"previous cached bytes");
+        assert!(!cached.with_file_name(format!("{name}.download")).exists());
+        valid.store(true, Ordering::Relaxed);
+        let fetched = updater.fetch(&release, os, None).await.unwrap();
+        assert_eq!(std::fs::read(fetched).unwrap(), payload);
+        endpoint.close().await;
+        server.abort();
+    }
 
     struct TestDir(PathBuf);
 

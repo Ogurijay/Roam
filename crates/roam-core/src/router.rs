@@ -17,7 +17,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::{
     keymap::{hid, remap_for_target},
     layout::{DeviceGeom, DeviceId, RectExt, World, entry_point},
-    settings::{DeviceSettings, Modifier, SwitchSettings},
+    settings::{DeviceSettings, KeyboardProfile, KeyboardSettings, Modifier, SwitchSettings},
 };
 
 /// 采集层产生的本地输入事件（坐标为主机本地逻辑点）。
@@ -110,6 +110,8 @@ pub struct Router {
     cursor: Box<dyn CursorControl>,
     focus: Focus,
     swap_cmd_ctrl: bool,
+    keyboard: KeyboardSettings,
+    keyboard_overrides: HashMap<DeviceId, KeyboardProfile>,
     settings: SwitchSettings,
     device_settings: HashMap<DeviceId, DeviceSettings>,
     /// 快捷键「组合 + 数字」对应的设备顺序，第 1 个是主机。
@@ -142,6 +144,8 @@ impl Router {
             cursor,
             focus: Focus::Local,
             swap_cmd_ctrl: true,
+            keyboard: KeyboardSettings::default(),
+            keyboard_overrides: HashMap::new(),
             settings: SwitchSettings::default(),
             device_settings: HashMap::new(),
             local_keys: HashSet::new(),
@@ -159,7 +163,32 @@ impl Router {
     // ------------------------------------------------------------ 配置
 
     pub fn set_swap_cmd_ctrl(&mut self, swap: bool) {
+        if self.swap_cmd_ctrl != swap {
+            self.return_home();
+        }
         self.swap_cmd_ctrl = swap;
+    }
+
+    pub fn set_keyboard_settings(&mut self, settings: KeyboardSettings) {
+        if self.keyboard != settings {
+            self.return_home();
+        }
+        self.keyboard = settings;
+    }
+
+    pub fn set_keyboard_override(&mut self, id: &str, profile: KeyboardProfile) {
+        let wanted = profile.enabled.then_some(&profile);
+        if self.keyboard_overrides.get(id) == wanted {
+            return;
+        }
+        if self.focused() == Some(id) {
+            self.return_home();
+        }
+        if profile.enabled {
+            self.keyboard_overrides.insert(id.to_string(), profile);
+        } else {
+            self.keyboard_overrides.remove(id);
+        }
     }
 
     pub fn set_switch_settings(&mut self, settings: SwitchSettings) {
@@ -210,6 +239,7 @@ impl Router {
             self.return_home();
         }
         self.peers.remove(id);
+        self.keyboard_overrides.remove(id);
     }
 
     /// 当前光标所在的被控设备。
@@ -228,6 +258,8 @@ impl Router {
                 .remote_keys
                 .iter()
                 .map(|&u| self.map_key(&id, u))
+                .collect::<HashSet<_>>()
+                .into_iter()
                 .collect();
             self.send(&id, Outbound::Stream(StreamMsg::KeyState { pressed }));
         }
@@ -596,6 +628,14 @@ impl Router {
             self.remote_keys.remove(&usage);
         }
         let mapped = self.map_key(&id, usage);
+        if !down
+            && self
+                .remote_keys
+                .iter()
+                .any(|&u| self.map_key(&id, u) == mapped)
+        {
+            return true;
+        }
         self.send(
             &id,
             Outbound::Stream(StreamMsg::Key {
@@ -652,7 +692,13 @@ impl Router {
 
     fn map_key(&self, id: &str, usage: u16) -> u16 {
         let to = self.peers.get(id).map(|p| p.os).unwrap_or(Os::Other);
-        remap_for_target(usage, self.host_os, to, self.swap_cmd_ctrl)
+        let fallback = remap_for_target(usage, self.host_os, to, self.swap_cmd_ctrl);
+        let profile = self
+            .keyboard_overrides
+            .get(id)
+            .filter(|p| p.enabled)
+            .or_else(|| self.keyboard.profile(self.host_os, to));
+        profile.map_or(fallback, |p| p.apply(usage, fallback))
     }
 
     // ------------------------------------------------------------ 发送
@@ -974,6 +1020,121 @@ mod tests {
         for usage in [hid::LEFT_CTRL, hid::LEFT_ALT, hid::LEFT_GUI] {
             r.handle(key(usage, true));
         }
+    }
+
+    fn profile(rules: &[(u16, u16)]) -> KeyboardProfile {
+        KeyboardProfile {
+            enabled: true,
+            mappings: rules
+                .iter()
+                .map(|&(from, to)| crate::settings::KeyRemap { from, to })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn custom_mapping_only_changes_remote_keys_in_its_direction() {
+        let (mut r, _, mut rx) = setup();
+        r.set_keyboard_settings(KeyboardSettings {
+            mac_to_windows: profile(&[(4, 5), (5, 6), (hid::LEFT_GUI, hid::LEFT_GUI)]),
+            windows_to_mac: profile(&[(4, 7)]),
+        });
+        assert!(!r.handle(key(4, true)));
+        assert!(!r.handle(key(4, false)));
+        assert!(drain(&mut rx).is_empty());
+        r.handle(mv(999.0, 400.0, 5.0, 0.0));
+        drain(&mut rx);
+        for (physical, mapped) in [(4, 5), (5, 6), (hid::LEFT_GUI, hid::LEFT_GUI)] {
+            for down in [true, false] {
+                assert!(r.handle(key(physical, down)));
+                assert_eq!(
+                    drain(&mut rx),
+                    vec![Outbound::Stream(StreamMsg::Key {
+                        usage: mapped,
+                        down
+                    })]
+                );
+            }
+        }
+        r.return_home();
+        r.host_os = Os::Windows;
+        r.peers.get_mut("win").unwrap().os = Os::MacOs;
+        assert_eq!(r.map_key("win", 4), 7);
+    }
+
+    #[test]
+    fn receiver_override_and_changes_release_remote_keys() {
+        let (mut r, _, mut rx) = setup();
+        r.set_keyboard_settings(KeyboardSettings {
+            mac_to_windows: profile(&[(4, 5)]),
+            ..Default::default()
+        });
+        r.set_keyboard_override("win", profile(&[(4, 6)]));
+        assert_eq!(r.map_key("win", 4), 6);
+        r.handle(mv(999.0, 400.0, 5.0, 0.0));
+        r.handle(key(4, true));
+        drain(&mut rx);
+        r.set_keyboard_override("win", KeyboardProfile::default());
+        assert_eq!(r.focused(), None);
+        assert!(r.remote_keys.is_empty());
+        assert_eq!(drain(&mut rx), vec![Outbound::Stream(StreamMsg::Leave)]);
+        assert_eq!(r.map_key("win", 4), 5);
+        r.handle(mv(999.0, 400.0, 5.0, 0.0));
+        drain(&mut rx);
+        r.set_keyboard_settings(KeyboardSettings::default());
+        assert_eq!(r.focused(), None);
+        assert_eq!(drain(&mut rx), vec![Outbound::Stream(StreamMsg::Leave)]);
+    }
+
+    #[test]
+    fn many_to_one_mapping_holds_output_until_all_sources_release() {
+        let (mut r, _, mut rx) = setup();
+        r.set_keyboard_settings(KeyboardSettings {
+            mac_to_windows: profile(&[(hid::LEFT_GUI, hid::LEFT_CTRL)]),
+            ..Default::default()
+        });
+        r.set_swap_cmd_ctrl(false);
+        r.handle(mv(999.0, 400.0, 5.0, 0.0));
+        r.handle(key(hid::LEFT_GUI, true));
+        r.handle(key(hid::LEFT_CTRL, true));
+        drain(&mut rx);
+        r.tick();
+        assert_eq!(
+            drain(&mut rx),
+            vec![Outbound::Stream(StreamMsg::KeyState {
+                pressed: vec![hid::LEFT_CTRL]
+            })]
+        );
+        r.handle(key(hid::LEFT_GUI, false));
+        assert!(drain(&mut rx).is_empty());
+        r.handle(key(hid::LEFT_CTRL, false));
+        assert_eq!(
+            drain(&mut rx),
+            vec![Outbound::Stream(StreamMsg::Key {
+                usage: hid::LEFT_CTRL,
+                down: false
+            })]
+        );
+    }
+
+    #[test]
+    fn return_home_hotkey_uses_physical_keys_before_custom_mapping() {
+        let (mut r, _, mut rx) = setup();
+        r.set_keyboard_settings(KeyboardSettings {
+            mac_to_windows: profile(&[
+                (hid::LEFT_GUI, 4),
+                (hid::LEFT_CTRL, 5),
+                (hid::LEFT_ALT, 6),
+                (hid::ESCAPE, 7),
+            ]),
+            ..Default::default()
+        });
+        r.handle(mv(999.0, 400.0, 5.0, 0.0));
+        hold_hotkey_mods(&mut r);
+        drain(&mut rx);
+        assert!(r.handle(key(hid::ESCAPE, true)));
+        assert_eq!(r.focused(), None);
+        assert_eq!(drain(&mut rx), vec![Outbound::Stream(StreamMsg::Leave)]);
     }
 
     #[test]

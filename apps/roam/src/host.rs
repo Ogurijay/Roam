@@ -108,6 +108,33 @@ pub struct Host {
 }
 
 impl Host {
+    pub fn receiver_keyboard(
+        &self,
+        id: &str,
+        profile: roam_core::settings::KeyboardProfile,
+    ) -> Result<()> {
+        profile.validate()?;
+        let to = self
+            .config
+            .lock()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.os);
+        let from = Os::current();
+        if matches!(
+            (from, to),
+            (Os::Windows, Some(Os::MacOs)) | (Os::MacOs, Some(Os::Windows))
+        ) {
+            self.router
+                .lock()
+                .unwrap()
+                .set_keyboard_override(id, profile);
+        }
+        Ok(())
+    }
+
     /// 主机可向在线被控端发送；被控端查询时也包含主机本身。
     pub fn file_targets(&self, exclude: &str) -> Vec<roam_proto::FileTarget> {
         let config = self.config.lock().unwrap();
@@ -288,11 +315,6 @@ impl Host {
         if locked && !paused {
             status.push_str(" · 已锁定当前屏幕");
         }
-        let title = match (&focused_name, paused) {
-            (_, true) => Some("⏸".to_string()),
-            (Some(name), _) => Some(format!("→ {name}")),
-            (None, _) => None,
-        };
         let update_label = {
             let u = self.updater.state.lock().unwrap();
             match (&u.phase, &u.latest) {
@@ -303,7 +325,6 @@ impl Host {
             }
         };
         tray::State {
-            title,
             tooltip: format!("Roam v{} · {status}", roam_proto::VERSION),
             status,
             paused,
@@ -452,6 +473,7 @@ impl Host {
         drop(status);
         let mut router = self.router.lock().unwrap();
         router.set_swap_cmd_ctrl(config.swap_cmd_ctrl);
+        router.set_keyboard_settings(config.input.keyboard.clone());
         router.set_switch_settings(config.switching.clone());
         router.set_device_settings(
             config
@@ -706,7 +728,7 @@ impl Host {
             let id = peer.id.clone();
             let rt = tokio::runtime::Handle::current();
             let ctx = Inbound {
-                file_host: Some(host.clone()),
+                host: Some(host.clone()),
                 peer: hello.name.clone(),
                 policy: {
                     let host = host.clone();
@@ -1438,7 +1460,7 @@ mod file_send_tests {
 
     fn inbound(host: Option<Arc<Host>>, transfers: Transfers, limit: Arc<AtomicU64>) -> Inbound {
         Inbound {
-            file_host: host,
+            host,
             peer: "test".into(),
             // 主动发送应独立于剪贴板开关，且不能调用剪贴板回调。
             policy: Arc::new(move || ClipboardPolicy {
@@ -1453,6 +1475,126 @@ mod file_send_tests {
             on_pull: Arc::new(|_| panic!("unexpected clipboard pull")),
             on_files: Arc::new(|_, _| panic!("explicit send changed clipboard")),
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[tokio::test]
+    async fn receiver_keyboard_policy_crosses_connection_and_can_be_disabled() {
+        use roam_core::{
+            layout::{Cell, DeviceGeom, World},
+            router::InputEvent,
+            settings::{KeyRemap, KeyboardProfile, KeyboardSettings},
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let root = std::env::temp_dir().join(format!("roam-keyboard-{}", files::new_id()));
+            let (h, c) = (endpoint().await, endpoint().await);
+            let (hc, ch) = pair(&h, &c).await;
+            let host = Host::new(
+                Store::open(Some(root.clone())).unwrap(),
+                h.clone(),
+                Box::new(NoCursor),
+            )
+            .unwrap();
+            let id = c.id().to_string();
+            let os = if Os::current() == Os::MacOs {
+                Os::Windows
+            } else {
+                Os::MacOs
+            };
+            host.config
+                .lock()
+                .unwrap()
+                .peers
+                .push(roam_core::config::Peer {
+                    id: id.clone(),
+                    name: "receiver".into(),
+                    ticket: String::new(),
+                    os: Some(os),
+                    displays: vec![],
+                    settings: Default::default(),
+                });
+            let profile = |to| KeyboardProfile {
+                enabled: true,
+                mappings: vec![KeyRemap { from: 4, to }],
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            {
+                let mut r = host.router.lock().unwrap();
+                r.set_world(World {
+                    devices: [host.host_id.clone(), id.clone()]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(col, id)| DeviceGeom {
+                            id,
+                            displays: vec![roam_proto::Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                w: 1000.0,
+                                h: 800.0,
+                            }],
+                            cells: vec![Cell {
+                                col: col as i32,
+                                row: 0,
+                            }],
+                        })
+                        .collect(),
+                });
+                r.add_peer(id.clone(), PeerLink { os, tx });
+                r.set_keyboard_settings(KeyboardSettings {
+                    mac_to_windows: profile(5),
+                    windows_to_mac: profile(5),
+                });
+            }
+            let task = tokio::spawn(sync::receive_loop_in(
+                hc,
+                inbound(
+                    Some(host.clone()),
+                    host.transfers.clone(),
+                    Arc::new(AtomicU64::new(1 << 20)),
+                ),
+                root.join("receive"),
+            ));
+            for (settings, expected) in [(profile(6), 6), (KeyboardProfile::default(), 5)] {
+                host.router.lock().unwrap().handle(InputEvent::Move {
+                    x: 999.0,
+                    y: 400.0,
+                    dx: 5.0,
+                    dy: 0.0,
+                });
+                assert!(host.router.lock().unwrap().focused().is_some());
+                crate::clipboard::send_side(&ch, roam_proto::side::KEYBOARD_MAPPING, &settings)
+                    .await
+                    .unwrap();
+                while host.router.lock().unwrap().focused().is_some() {
+                    tokio::task::yield_now().await;
+                }
+                while rx.try_recv().is_ok() {}
+                let mut r = host.router.lock().unwrap();
+                r.handle(InputEvent::Move {
+                    x: 999.0,
+                    y: 400.0,
+                    dx: 5.0,
+                    dy: 0.0,
+                });
+                r.handle(InputEvent::Key {
+                    usage: 4,
+                    down: true,
+                });
+                assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|m| m
+                    == Outbound::Stream(StreamMsg::Key {
+                        usage: expected,
+                        down: true
+                    })));
+                r.return_home();
+            }
+            task.abort();
+            h.close().await;
+            c.close().await;
+            drop(host);
+            std::fs::remove_dir_all(root).unwrap();
+        })
+        .await
+        .expect("keyboard policy timed out");
     }
 
     #[tokio::test]

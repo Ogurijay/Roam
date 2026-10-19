@@ -265,6 +265,8 @@ pub mod side {
     /// 用户主动发送文件；不改写接收端剪贴板。
     pub const DIRECT_FILE_OFFER: u8 = 7;
     pub const FILE_COMMAND: u8 = 8;
+    /// 接收端的跨系统键盘映射覆盖；原始按键仍由主机处理快捷键，再统一映射后发送。
+    pub const KEYBOARD_MAPPING: u8 = 9;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

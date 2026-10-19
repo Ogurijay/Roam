@@ -12,6 +12,7 @@ roam-proto = { path = "../roam-proto" }
 tracing.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+foreign-types = "0.5"
 core-foundation = "0.10"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 libc = "0.2"

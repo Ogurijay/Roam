@@ -262,10 +262,28 @@
   <button data-tab="hotkeys" data-host>快捷键</button>
   <button data-tab="updates">更新</button>
   <button data-tab="files">发送文件</button>
+  <button data-tab="input">输入设置</button>
   <button data-tab="logs">日志</button>
 </nav>
 
 <main>
+  <section class="tab" data-panel="input">
+    <div class="card" id="macScrollCard" hidden>
+      <h3>Mac 鼠标与触摸板</h3>
+      <label class="check"><input type="checkbox" id="reverseMouse"><span>反转普通鼠标滚轮</span></label>
+      <label class="check"><input type="checkbox" id="reverseTrackpad"><span>反转触摸板 / 连续滚动</span></label>
+      <p class="muted small">相对于当前系统方向反转。主控、被控角色都有效；本机硬件产生的滚动在留在本机或发往其他电脑前统一处理，Roam 远程输入不重复反转。Magic Mouse、部分平滑滚动鼠标也属于连续滚动组。</p>
+      <p class="muted small" id="scrollFilterStatus" role="status"></p>
+    </div>
+    <div class="card">
+      <h3>跨设备键盘映射</h3>
+      <p class="muted small" id="keyboardScope"></p>
+      <p class="muted small">按物理按键映射，不改变本机打字。未单独设置的按键沿用原来的 Cmd / Ctrl 对调规则。接收端开启的自定义规则优先于发送端；修改规则会先返回主机并释放已按下按键。</p>
+      <div id="keyboardProfiles"></div>
+      <p class="muted small">Mac 按 MacBook 常用布局列出，不含数字小键盘。Fn + Delete、Fn + 方向键按系统产生的 Delete / Home / End / Page Up / Page Down 事件映射。Fn / 地球键本身、Touch ID、亮度和媒体功能暂不提供自由重映射。</p>
+    </div>
+    <div class="row"><button class="primary" id="saveInput">保存输入设置</button><button id="discardInput">放弃修改</button><span class="muted small" id="inputSaved" role="status"></span></div>
+  </section>
   <div class="card" id="sendPanel" hidden>
     <h3>发送到其他电脑</h3>
     <p id="sendNames" style="overflow-wrap:anywhere"></p>
@@ -441,19 +459,16 @@
 
   <!-- ============ 更新 ============ -->
   <section class="tab" data-panel="updates">
-    <div class="card" id="hostUpdate">
+    <div class="card">
       <h3>应用内更新</h3>
       <div class="row"><span class="grow" id="updInfo"></span><button id="checkUpdate">检查更新</button></div>
       <div id="updResult" class="small" style="margin-top:8px"></div>
+      <p id="updateScope" class="muted small"></p>
       <div class="field" style="margin-top:14px">
         <div class="head"><span>下载镜像（可选）</span></div>
         <input type="text" id="mirror" placeholder="例如 https://ghfast.top/" style="max-width:420px">
         <div class="desc">从 GitHub 下载很慢时填一个加速镜像前缀；安装包仍会用 GitHub 上的校验和验证，不怕镜像篡改。</div>
       </div>
-    </div>
-    <div class="card" id="clientUpdate">
-      <h3>更新</h3>
-      <p class="muted" style="margin:0">被控端由主机统一更新：主机发现新版本后，点「更新所有设备」会把新版本推送到这里并自动重启。</p>
     </div>
   </section>
 
@@ -532,8 +547,6 @@ function render() {
   if (!isHost && document.querySelector(`#tabs [data-tab="${tab}"]`).hidden) switchTab('devices');
   $('hostDevices').hidden = !isHost;
   $('clientDevices').hidden = isHost;
-  $('hostUpdate').hidden = !isHost;
-  $('clientUpdate').hidden = isHost;
 
   if (isHost) renderHost(); else renderClient();
   renderTransfers(isHost ? 'transferList' : 'clientTransferList', isHost ? 'transferCard' : 'clientTransferCard');
@@ -542,7 +555,93 @@ function render() {
   $('menuHelp').textContent = state.os === 'Windows'
     ? '在资源管理器中选中文件，右键 → 发送到 → Roam - 发送到其他电脑。Windows 11 可能需要先点「显示更多选项」。'
     : '在 Finder 中选中文件，右键 → Roam - 发送到其他电脑；部分系统版本会放在「快速操作」或「服务」中。';
+  renderInputSettings();
+  renderUpdate();
 }
+
+let inputDraft = null, inputDirty = false, inputRevision = '';
+const commonKeys = [
+  ...Array.from({length:26}, (_,i) => [i+4, String.fromCharCode(65+i)]),
+  ...'1234567890'.split('').map((v,i) => [0x1e+i,v]),
+  [0x29,'Esc'], [0x2b,'Tab'], [0x39,'Caps Lock'], [0x28,'Return / Enter'], [0x2c,'Space'],
+  [0x2a,'Backspace'], [0x4c,'Delete'], [0x4a,'Home'], [0x4d,'End'], [0x4b,'Page Up'], [0x4e,'Page Down'],
+  [0x50,'←'],[0x51,'↓'],[0x52,'↑'],[0x4f,'→'],
+  ...Array.from({length:12},(_,i) => [0x3a+i,`F${i+1}`]),
+  ...['-','=','[',']','\\','', ';',"'",'`',',','.','/'].map((v,i) => [0x2d+i,v]).filter(k => k[1]),
+  [0xe0,'左 Ctrl'],[0xe1,'左 Shift'],[0xe2,'左 Alt'],[0xe3,'左 Win'],
+  [0xe4,'右 Ctrl'],[0xe5,'右 Shift'],[0xe6,'右 Alt'],[0xe7,'右 Win'],
+];
+function keyOptions(mac, selected) {
+  const labels = mac ? {42:'Delete ⌫（退格）',76:'Fn + Delete ⌦',74:'Fn + ←（Home）',77:'Fn + →（End）',75:'Fn + ↑（Page Up）',78:'Fn + ↓（Page Down）',224:'左 Control',226:'左 Option',227:'左 Command',228:'右 Control',230:'右 Option',231:'右 Command'} : {};
+  return commonKeys.map(([id,name]) => `<option value="${id}" ${id === selected ? 'selected' : ''}>${esc(labels[id] || name)}</option>`).join('');
+}
+function renderKeyboardProfiles() {
+  $('keyboardProfiles').innerHTML = ['mac_to_windows','windows_to_mac'].map(direction => {
+    const p = inputDraft.keyboard[direction], mac = direction === 'mac_to_windows';
+    return `<div style="margin-top:20px" data-direction="${direction}">
+      <h3>${mac ? 'Mac → Windows' : 'Windows → Mac'}</h3>
+      <label class="check"><input type="checkbox" data-map-enabled ${p.enabled ? 'checked' : ''}><span>启用这个方向的自定义映射</span></label>
+      <div class="row" style="margin:8px 0"><button data-preset="shortcuts" class="small">Cmd / Ctrl 互换</button><button data-preset="position" class="small">Ctrl / Win / Command 不互换</button><button data-preset="clear" class="small">清除自定义</button></div>
+      ${p.mappings.map((r,i) => `<div class="row" style="margin:8px 0" data-map-row="${i}"><select aria-label="${mac ? 'Mac' : 'Windows'} 来源按键 ${i+1}" data-map-from>${keyOptions(mac,r.from)}</select><span>→</span><select aria-label="${mac ? 'Windows' : 'Mac'} 目标按键 ${i+1}" data-map-to>${keyOptions(!mac,r.to)}</select><button data-remove-rule class="small">删除</button></div>`).join('')}
+      <button data-add-rule class="small">添加映射</button>
+    </div>`;
+  }).join('');
+}
+function renderInputSettings() {
+  const revision = JSON.stringify(state.input);
+  if (!inputDraft || (!inputDirty && revision !== inputRevision)) {
+    inputDraft = structuredClone(state.input); inputRevision = revision;
+    renderKeyboardProfiles();
+    $('reverseMouse').checked = inputDraft.mac_scroll.reverse_mouse;
+    $('reverseTrackpad').checked = inputDraft.mac_scroll.reverse_trackpad;
+  }
+  $('macScrollCard').hidden = !state.mac_scroll;
+  if (state.mac_scroll) {
+    const s = state.mac_scroll, source = {mouse:'普通鼠标滚轮', continuous:'触摸板 / 连续滚动', none:'尚未检测到滚动'}[s.source];
+    $('scrollFilterStatus').textContent = `${s.ready ? '滚动过滤已运行' : s.error || '滚动过滤未启动'} · ${source}`;
+  }
+  const host = state.client?.host;
+  const supported = host && (() => { const v=host.version.split('.').map(Number); return v[0]>0 || v[1]>3 || (v[1]===3 && v[2]>=4); })();
+  $('keyboardScope').textContent = state.role === 'host'
+    ? '主控模式：Mac 主机控制 Windows 时使用 Mac → Windows。Windows 主机控制 Mac 时使用 Windows → Mac。'
+    : `被控模式：本机对应方向的接收规则会发送给主机，再由主机统一转换，避免重复映射。${supported ? '' : '主机需要 v0.3.4 或更新版本才能应用接收规则；当前设置可先保存。'}`;
+  $('inputSaved').textContent = inputDirty ? '有未保存的修改' : '设置已保存';
+}
+function dirtyInput() { inputDirty = true; $('inputSaved').textContent = '有未保存的修改'; }
+for (const [id,key] of [['reverseMouse','reverse_mouse'],['reverseTrackpad','reverse_trackpad']]) {
+  $(id).addEventListener('change', e => { inputDraft.mac_scroll[key] = e.target.checked; dirtyInput(); });
+}
+$('keyboardProfiles').addEventListener('change', e => {
+  const group=e.target.closest('[data-direction]'); if (!group) return;
+  const p=inputDraft.keyboard[group.dataset.direction];
+  if (e.target.hasAttribute('data-map-enabled')) p.enabled=e.target.checked;
+  else {
+    const row=e.target.closest('[data-map-row]'); if (!row) return;
+    p.mappings[Number(row.dataset.mapRow)][e.target.hasAttribute('data-map-from')?'from':'to']=Number(e.target.value);
+  }
+  dirtyInput();
+});
+$('keyboardProfiles').addEventListener('click', e => {
+  const group=e.target.closest('[data-direction]'); if (!group) return;
+  const p=inputDraft.keyboard[group.dataset.direction];
+  if (e.target.hasAttribute('data-add-rule')) {
+    const from=[0x39,...commonKeys.map(k=>k[0])].find(k=>!p.mappings.some(r=>r.from===k));
+    if (from == null) return;
+    p.enabled=true; p.mappings.push({from,to:from});
+  } else if (e.target.hasAttribute('data-remove-rule')) p.mappings.splice(Number(e.target.closest('[data-map-row]').dataset.mapRow),1);
+  else if (e.target.dataset.preset) {
+    const preset=e.target.dataset.preset; p.enabled=preset!=='clear';
+    p.mappings=preset==='clear'?[]:[0xe0,0xe3,0xe4,0xe7].map(from=>({from,to:preset==='position'?from:({224:227,227:224,228:231,231:228}[from])}));
+  } else return;
+  dirtyInput(); renderKeyboardProfiles();
+});
+$('saveInput').addEventListener('click', async () => {
+  $('saveInput').disabled=true;
+  try { await api('PUT','/api/input-settings',inputDraft); inputDirty=false; await refresh(); toast('输入设置已保存'); }
+  catch(err) { toast(err.message); }
+  finally { $('saveInput').disabled=false; }
+});
+$('discardInput').addEventListener('click', () => { inputDraft=null; inputDirty=false; renderInputSettings(); });
 
 let sendToken = '', sending = false, loadingRequest = false, sendError = '';
 function readSendToken() {
@@ -644,7 +743,6 @@ function renderHost() {
   renderDetail();
   renderSwitching();
   renderClipboard();
-  renderUpdate();
 }
 
 function deviceNumber(d) {
@@ -916,13 +1014,15 @@ $('clipFileMax').addEventListener('change', e => saveClipboard({ max_file_mb: Nu
 // ---------- 更新
 
 function renderUpdate() {
-  const u = state.host.update;
+  const u = state.update, isHost = state.role === 'host';
+  const busy = !!u.phase;
   const checked = u.last_checked ? new Date(u.last_checked * 1000).toLocaleString() : '尚未检查';
   $('updInfo').textContent = `当前版本 v${state.version} · 上次检查：${checked}`;
-  setValue($('mirror'), state.host.update_mirror || '');
+  $('updateScope').textContent = isHost ? '主机更新会先同步其他设备，再更新本机。' : '可独立从 GitHub 更新本机，无需主机在线；仍支持接收已授权主机推送的更新。更新后自动重启并等待主机重连。';
+  setValue($('mirror'), state.update_mirror || '');
   const parts = [];
-  if (u.available) parts.push(`<b>发现新版本 v${esc(u.latest.version)}</b> <button class="primary small" data-apply-update>更新所有设备</button>${u.latest.notes ? `<pre class="muted" style="white-space:pre-wrap;margin:8px 0 0">${esc(u.latest.notes)}</pre>` : ''}`);
-  else if (u.latest) parts.push(`<span style="color:var(--ok)">本机已经是最新版本</span> <button class="primary small" data-apply-update>同步其他设备</button>`);
+  if (u.available) parts.push(`<b>发现新版本 v${esc(u.latest.version)}</b> <button class="primary small" data-apply-update ${busy ? 'disabled' : ''}>${isHost ? '更新所有设备' : '更新本机并重启'}</button>${u.latest.notes ? `<pre class="muted" style="white-space:pre-wrap;margin:8px 0 0">${esc(u.latest.notes)}</pre>` : ''}`);
+  else if (u.latest) parts.push(`<span style="color:var(--ok)">本机已经是最新版本</span>${isHost ? ` <button class="primary small" data-apply-update ${busy ? 'disabled' : ''}>同步其他设备</button>` : ''}`);
   if (u.phase) parts.push(`<div class="muted" style="margin-top:6px">${esc(u.phase)}</div>`);
   if (u.error) parts.push(`<div class="err">${esc(u.error)}</div>`);
   if (u.devices.length) parts.push(`<div class="muted" style="margin-top:6px">${u.devices.map(([n, r]) => `${esc(n)}：${esc(r)}`).join('；')}</div>`);
@@ -934,10 +1034,10 @@ $('checkUpdate').addEventListener('click', async e => {
   catch (err) { toast(err.message); }
   finally { e.target.disabled = false; refresh(); }
 });
-$('mirror').addEventListener('change', e => api('PUT', '/api/settings', { update_mirror: e.target.value }).then(() => toast('已保存')).catch(err => toast(err.message)));
+$('mirror').addEventListener('change', e => api('PUT', '/api/update/mirror', { update_mirror: e.target.value }).then(() => toast('已保存')).catch(err => toast(err.message)));
 document.addEventListener('click', async e => {
   if (e.target.dataset?.applyUpdate === undefined) return;
-  if (!confirm('将把最新版推送给需要更新的在线设备；本机有新版时也会更新并重启。离线设备可在连接后再次同步。继续吗？')) return;
+  if (!confirm(state.role === 'host' ? '将把最新版推送给需要更新的在线设备；本机有新版时也会更新并重启。离线设备可在连接后再次同步。继续吗？' : '将下载并校验本机的新版本，安装后自动重启。本次操作只更新这台电脑。继续吗？')) return;
   try { await api('POST', '/api/update/apply'); refresh(); } catch (err) { toast(err.message); }
 });
 
@@ -949,6 +1049,9 @@ function renderClient() {
   const banners = [];
   if (c.permission) banners.push(`<div class="banner"><span class="grow">${esc(c.permission)}</span></div>`);
   if (c.pending) banners.push(`<div class="banner info"><span class="grow">「${esc(c.pending[0])}」请求控制本机，请在弹出的窗口里确认</span><span class="code">${esc(c.pending[1])}</span></div>`);
+  const u = state.update;
+  if (u.phase) banners.push(`<div class="banner info"><span class="grow">${esc(u.phase)}</span></div>`);
+  else if (u.available) banners.push(`<div class="banner good"><span class="grow">发现新版本 <b>v${esc(u.latest.version)}</b></span><button class="primary" data-apply-update>更新本机并重启</button></div>`);
   setHtml($('banners'), banners.join(''));
 
   const st = $('clientStatus');

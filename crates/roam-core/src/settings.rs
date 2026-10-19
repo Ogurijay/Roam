@@ -4,6 +4,85 @@ use serde::{Deserialize, Serialize};
 
 use crate::keymap::hid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRemap {
+    pub from: u16,
+    pub to: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyboardProfile {
+    pub enabled: bool,
+    pub mappings: Vec<KeyRemap>,
+}
+
+impl KeyboardProfile {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.mappings.len() <= 128, "映射最多 128 条");
+        let mut sources = std::collections::HashSet::new();
+        for rule in &self.mappings {
+            anyhow::ensure!(sources.insert(rule.from), "同一个来源按键只能设置一次");
+            for usage in [rule.from, rule.to] {
+                anyhow::ensure!(
+                    crate::keymap::hid_to_mac(usage).is_some()
+                        && crate::keymap::hid_to_win(usage).is_some(),
+                    "不支持的按键：{usage:#x}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn apply(&self, physical: u16, fallback: u16) -> u16 {
+        if self.enabled {
+            if let Some(rule) = self.mappings.iter().find(|r| r.from == physical) {
+                return rule.to;
+            }
+        }
+        fallback
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyboardSettings {
+    pub mac_to_windows: KeyboardProfile,
+    pub windows_to_mac: KeyboardProfile,
+}
+
+impl KeyboardSettings {
+    pub fn profile(&self, from: roam_proto::Os, to: roam_proto::Os) -> Option<&KeyboardProfile> {
+        match (from, to) {
+            (roam_proto::Os::MacOs, roam_proto::Os::Windows) => Some(&self.mac_to_windows),
+            (roam_proto::Os::Windows, roam_proto::Os::MacOs) => Some(&self.windows_to_mac),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MacScrollSettings {
+    pub reverse_mouse: bool,
+    /// 连续滚动设备，包括触摸板及部分触控/平滑滚动鼠标。
+    pub reverse_trackpad: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InputSettings {
+    pub mac_scroll: MacScrollSettings,
+    pub keyboard: KeyboardSettings,
+}
+
+impl InputSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.keyboard.mac_to_windows.validate()?;
+        self.keyboard.windows_to_mac.validate()
+    }
+}
+
 /// 修饰键（左右任意一个按下即算按下）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -158,6 +237,38 @@ impl SwitchSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_rules_are_explicit_non_cascading_and_validated() {
+        let mut p = KeyboardProfile {
+            enabled: true,
+            mappings: vec![
+                KeyRemap {
+                    from: hid::LEFT_GUI,
+                    to: hid::LEFT_GUI,
+                },
+                KeyRemap { from: 4, to: 5 },
+                KeyRemap { from: 5, to: 6 },
+            ],
+        };
+        p.validate().unwrap();
+        assert_eq!(p.apply(hid::LEFT_GUI, hid::LEFT_CTRL), hid::LEFT_GUI);
+        assert_eq!(p.apply(4, 4), 5);
+        assert_eq!(p.apply(7, 7), 7);
+        p.enabled = false;
+        assert_eq!(p.apply(hid::LEFT_GUI, hid::LEFT_CTRL), hid::LEFT_CTRL);
+        p.mappings.push(KeyRemap { from: 4, to: 6 });
+        assert!(p.validate().is_err());
+        p.mappings = vec![KeyRemap {
+            from: 0xffff,
+            to: 4,
+        }];
+        assert!(p.validate().is_err());
+        assert_eq!(
+            serde_json::from_str::<InputSettings>("{}").unwrap(),
+            InputSettings::default()
+        );
+    }
 
     #[test]
     fn old_configs_get_defaults() {

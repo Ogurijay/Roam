@@ -4,6 +4,8 @@ use roam_proto::DisplayInfo;
 
 #[cfg(target_os = "macos")]
 pub mod mac;
+#[cfg(target_os = "macos")]
+pub mod mac_scroll;
 pub mod power;
 #[cfg(windows)]
 pub mod windows;

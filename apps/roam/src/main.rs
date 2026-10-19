@@ -180,6 +180,8 @@ fn main() -> Result<()> {
     };
     // 常驻后台也要保持实时响应（关闭 App Nap / 后台节能）
     roam_input::power::keep_responsive();
+    #[cfg(target_os = "macos")]
+    roam_input::mac_scroll::configure(store.load()?.input.mac_scroll);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -189,6 +191,21 @@ fn main() -> Result<()> {
             Role::Host => App::Host(start_host(store, demo).await?),
             Role::Client => App::Client(Client::start(store).await?),
         };
+        #[cfg(target_os = "macos")]
+        if let App::Client(client) = &app {
+            if let Err(err) = &client.permission {
+                roam_input::mac_scroll::set_status(Err(err.clone()));
+            } else {
+                std::thread::Builder::new()
+                    .name("roam-local-scroll".into())
+                    .spawn(|| {
+                        if let Err(err) = roam_input::mac::run_scroll_filter() {
+                            roam_input::mac_scroll::set_status(Err(format!("{err:#}")));
+                            tracing::warn!("本机滚动过滤未启动: {err:#}");
+                        }
+                    })?;
+            }
+        }
         let addr = ui::serve(app.clone(), cli.ui_port).await?;
         tracing::info!("界面：http://{addr}");
         anyhow::Ok((app, format!("http://{addr}")))
@@ -230,9 +247,13 @@ fn run_with_tray(
             (spec, host.tray_state())
         }
         App::Client(client) => {
-            client.set_tray(handle.clone());
+            {
+                let _guard = runtime.enter();
+                client.set_tray(handle.clone());
+            }
             let spec = Spec {
                 copy_ticket: true,
+                update: true,
                 autostart: autostart::is_enabled(AUTOSTART_ARGS),
                 ..Default::default()
             };
@@ -262,17 +283,27 @@ fn run_with_tray(
                 }
             }
             Action::Update => {
-                if let App::Host(host) = &app {
-                    let host = host.clone();
-                    runtime.spawn(async move {
-                        let checked = host.updater.state.lock().unwrap().latest.is_some();
-                        if checked {
-                            let _ = host.update_all().await;
-                        } else {
-                            let _ = host.updater.check().await;
+                let app = app.clone();
+                runtime.spawn(async move {
+                    match app {
+                        App::Host(host) => {
+                            let checked = host.updater.state.lock().unwrap().latest.is_some();
+                            if checked {
+                                let _ = host.update_all().await;
+                            } else {
+                                let _ = host.updater.check().await;
+                            }
                         }
-                    });
-                }
+                        App::Client(client) => {
+                            let available = client.updater.state.lock().unwrap().available;
+                            if available {
+                                let _ = client.update_self().await;
+                            } else {
+                                let _ = client.updater.check().await;
+                            }
+                        }
+                    }
+                });
             }
             Action::Autostart(on) => {
                 if let Err(err) = autostart::set_enabled(AUTOSTART_ARGS, on) {
@@ -388,6 +419,7 @@ async fn start_host(store: Store, demo: bool) -> Result<Arc<Host>> {
 #[cfg(target_os = "macos")]
 fn start_capture(host: &Arc<Host>) {
     if let Err(err) = roam_input::mac::check_permissions() {
+        roam_input::mac_scroll::set_status(Err(format!("{err:#}")));
         tracing::warn!("{err:#}");
         *host.capture.lock().unwrap() = Err(format!("{err:#}"));
         return;
@@ -448,6 +480,8 @@ fn spawn_capture(host: &Arc<Host>, run: fn(CaptureHandler) -> Result<()>) {
                 swallowed
             }));
             if let Err(err) = result {
+                #[cfg(target_os = "macos")]
+                roam_input::mac_scroll::set_status(Err(format!("{err:#}")));
                 tracing::error!("键鼠采集失败: {err:#}");
                 *capture.capture.lock().unwrap() = Err(format!("{err:#}"));
             }

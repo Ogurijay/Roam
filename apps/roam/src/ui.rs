@@ -13,7 +13,7 @@ use axum::{
 use roam_core::{
     config::Role,
     layout::{Cell, GRID_COLS, GRID_ROWS, grid_key},
-    settings::{ClipboardSettings, DeviceSettings, SwitchSettings},
+    settings::{ClipboardSettings, DeviceSettings, InputSettings, SwitchSettings},
 };
 use roam_proto::{DisplayInfo, Os};
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,12 @@ pub enum App {
 }
 
 impl App {
+    fn updater(&self) -> &crate::update::Updater {
+        match self {
+            Self::Host(h) => &h.updater,
+            Self::Client(c) => &c.updater,
+        }
+    }
     fn host(&self) -> Result<&Arc<Host>, ApiError> {
         match self {
             App::Host(h) => Ok(h),
@@ -68,6 +74,7 @@ pub async fn serve(app: App, port: u16) -> Result<SocketAddr> {
         .route("/api/open-downloads", post(open_downloads))
         .route("/api/open-logs", post(open_logs))
         .route("/api/context-menu", put(set_context_menu))
+        .route("/api/input-settings", put(set_input_settings))
         .route(
             "/api/files/requests/{token}",
             get(file_request).post(send_request),
@@ -86,6 +93,7 @@ pub async fn serve(app: App, port: u16) -> Result<SocketAddr> {
         .route("/api/settings", put(set_settings))
         .route("/api/update/check", post(check_update))
         .route("/api/update/apply", post(apply_update))
+        .route("/api/update/mirror", put(set_update_mirror))
         // 被控端
         .route("/api/trusted/{id}", delete(revoke_host))
         .route("/api/copy-ticket", post(copy_ticket))
@@ -180,6 +188,10 @@ struct ClientView {
 
 #[derive(Serialize)]
 struct StateView {
+    update: UpdateState,
+    update_mirror: Option<String>,
+    input: InputSettings,
+    mac_scroll: Option<MacScrollView>,
     context_menu: bool,
     role: Role,
     id: String,
@@ -201,6 +213,7 @@ async fn state(State(app): State<App>) -> Json<StateView> {
 
 fn host_state(host: &Host) -> StateView {
     let config = host.config.lock().unwrap().clone();
+    let update = host.updater.state.lock().unwrap().clone();
     let status = host.status.lock().unwrap().clone();
     let capture = host.capture.lock().unwrap().clone();
     let (focused, edge_locked) = {
@@ -251,6 +264,10 @@ fn host_state(host: &Host) -> StateView {
     }));
 
     StateView {
+        update: update.clone(),
+        update_mirror: config.update_mirror.clone(),
+        input: config.input.clone(),
+        mac_scroll: mac_scroll_view(),
         context_menu: crate::send_menu::enabled(),
         role: Role::Host,
         id: host.host_id.clone(),
@@ -276,7 +293,7 @@ fn host_state(host: &Host) -> StateView {
                 .filter(|d| d.id != host.host_id && !config.peers.iter().any(|p| p.id == d.id))
                 .collect(),
             devices,
-            update: host.updater.state.lock().unwrap().clone(),
+            update,
             update_mirror: config.update_mirror.clone(),
             grid: (GRID_COLS, GRID_ROWS),
         }),
@@ -293,6 +310,10 @@ fn client_state(client: &Client) -> StateView {
     let pending = client.pending.lock().unwrap().clone();
     let status = client.status_text();
     StateView {
+        update: client.updater.state.lock().unwrap().clone(),
+        update_mirror: config.update_mirror.clone(),
+        input: config.input.clone(),
+        mac_scroll: mac_scroll_view(),
         context_menu: crate::send_menu::enabled(),
         role: Role::Client,
         id: client.id.clone(),
@@ -372,6 +393,54 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 }
 
 type ApiResult<T = StatusCode> = Result<T, ApiError>;
+
+#[derive(Serialize)]
+struct MacScrollView {
+    ready: bool,
+    error: Option<String>,
+    source: &'static str,
+}
+
+fn mac_scroll_view() -> Option<MacScrollView> {
+    #[cfg(target_os = "macos")]
+    {
+        let (ready, error, source) = roam_input::mac_scroll::status();
+        Some(MacScrollView {
+            ready,
+            error,
+            source,
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+async fn set_input_settings(
+    State(app): State<App>,
+    Json(settings): Json<InputSettings>,
+) -> ApiResult {
+    settings.validate()?;
+    match &app {
+        App::Host(host) => {
+            host.config.lock().unwrap().input = settings.clone();
+            host.save_config()?;
+            host.rebuild_world();
+        }
+        App::Client(client) => {
+            let mut config = client.store.load()?;
+            config.input = settings.clone();
+            client.store.save(&config)?;
+            if let Err(err) = client.push_keyboard_settings().await {
+                tracing::warn!("键盘映射已保存，将在重新连接主机后应用: {err:#}");
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    roam_input::mac_scroll::configure(settings.mac_scroll);
+    Ok(StatusCode::NO_CONTENT)
+}
 
 #[derive(Deserialize)]
 struct MenuBody {
@@ -654,13 +723,41 @@ async fn go_home(State(app): State<App>) -> ApiResult {
 }
 
 async fn check_update(State(app): State<App>) -> ApiResult<Json<bool>> {
-    Ok(Json(app.host()?.updater.check().await?))
+    Ok(Json(app.updater().check().await?))
+}
+
+#[derive(Deserialize)]
+struct MirrorBody {
+    update_mirror: String,
+}
+
+async fn set_update_mirror(State(app): State<App>, Json(body): Json<MirrorBody>) -> ApiResult {
+    let mirror = body.update_mirror.trim().to_string();
+    if !mirror.is_empty() && !mirror.starts_with("https://") && !mirror.starts_with("http://") {
+        return Err(anyhow::anyhow!("镜像地址需要以 http:// 或 https:// 开头").into());
+    }
+    let mirror = (!mirror.is_empty()).then_some(mirror);
+    match &app {
+        App::Host(h) => {
+            h.config.lock().unwrap().update_mirror = mirror;
+            h.save_config()?;
+        }
+        App::Client(c) => {
+            let mut config = c.store.load()?;
+            config.update_mirror = mirror;
+            c.store.save(&config)?;
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn apply_update(State(app): State<App>) -> ApiResult {
-    let host = app.host()?.clone();
     tokio::spawn(async move {
-        if let Err(err) = host.update_all().await {
+        let result = match app {
+            App::Host(h) => h.update_all().await,
+            App::Client(c) => c.update_self().await,
+        };
+        if let Err(err) = result {
             tracing::warn!("更新失败: {err:#}");
         }
     });

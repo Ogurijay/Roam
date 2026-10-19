@@ -46,7 +46,7 @@ unsafe extern "C" {
 }
 
 /// 运行时查找可选 / 私有符号，找不到就跳过，避免链接失败。
-fn dlsym(name: &CStr) -> Option<*mut c_void> {
+pub(crate) fn dlsym(name: &CStr) -> Option<*mut c_void> {
     let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
     (!ptr.is_null()).then_some(ptr)
 }
@@ -193,6 +193,18 @@ static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 ///
 /// `handler` 对每个输入事件返回 `true` 表示吞掉（不交给 macOS）。
 pub fn run_capture(handler: impl FnMut(InputEvent) -> bool + Send + 'static) -> Result<()> {
+    run_tap(handler, false)
+}
+
+/// 被控角色也能过滤本机滚轮，不采集键盘或鼠标移动。
+pub fn run_scroll_filter() -> Result<()> {
+    run_tap(|_| false, true)
+}
+
+fn run_tap(
+    handler: impl FnMut(InputEvent) -> bool + Send + 'static,
+    scroll_only: bool,
+) -> Result<()> {
     // 回调太慢会被系统暂停 tap（整个系统的键鼠都会跟着卡一下），采集线程用最高的 QoS
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
@@ -202,22 +214,26 @@ pub fn run_capture(handler: impl FnMut(InputEvent) -> bool + Send + 'static) -> 
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
-        vec![
-            CGEventType::MouseMoved,
-            CGEventType::LeftMouseDragged,
-            CGEventType::RightMouseDragged,
-            CGEventType::OtherMouseDragged,
-            CGEventType::LeftMouseDown,
-            CGEventType::LeftMouseUp,
-            CGEventType::RightMouseDown,
-            CGEventType::RightMouseUp,
-            CGEventType::OtherMouseDown,
-            CGEventType::OtherMouseUp,
-            CGEventType::KeyDown,
-            CGEventType::KeyUp,
-            CGEventType::FlagsChanged,
-            CGEventType::ScrollWheel,
-        ],
+        if scroll_only {
+            vec![CGEventType::ScrollWheel]
+        } else {
+            vec![
+                CGEventType::MouseMoved,
+                CGEventType::LeftMouseDragged,
+                CGEventType::RightMouseDragged,
+                CGEventType::OtherMouseDragged,
+                CGEventType::LeftMouseDown,
+                CGEventType::LeftMouseUp,
+                CGEventType::RightMouseDown,
+                CGEventType::RightMouseUp,
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+                CGEventType::KeyDown,
+                CGEventType::KeyUp,
+                CGEventType::FlagsChanged,
+                CGEventType::ScrollWheel,
+            ]
+        },
         move |_proxy, etype, event| {
             if matches!(
                 etype,
@@ -231,6 +247,12 @@ pub fn run_capture(handler: impl FnMut(InputEvent) -> bool + Send + 'static) -> 
                 return CallbackResult::Keep;
             }
             if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == INJECTED_MARK {
+                return CallbackResult::Keep;
+            }
+            if matches!(etype, CGEventType::ScrollWheel) {
+                crate::mac_scroll::transform(event);
+            }
+            if scroll_only {
                 return CallbackResult::Keep;
             }
             let mut handler = handler.lock().unwrap();
@@ -256,6 +278,7 @@ pub fn run_capture(handler: impl FnMut(InputEvent) -> bool + Send + 'static) -> 
         .map_err(|_| anyhow::anyhow!("无法创建 run loop source"))?;
     unsafe { CFRunLoop::get_current().add_source(&source, kCFRunLoopCommonModes) };
     tap.enable();
+    crate::mac_scroll::set_status(Ok(()));
     CFRunLoop::run_current();
     Ok(())
 }

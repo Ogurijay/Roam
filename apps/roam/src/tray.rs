@@ -32,8 +32,6 @@ pub enum Action {
 /// 托盘显示的状态。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct State {
-    /// macOS 菜单栏图标旁的文字（Windows 忽略）。
-    pub title: Option<String>,
     pub tooltip: String,
     /// 菜单第一行的状态说明。
     pub status: String,
@@ -174,13 +172,7 @@ impl Tray {
                             .with_tooltip(&current.tooltip);
                         // macOS 用模板图标，自动适配浅色 / 深色菜单栏；点击图标弹出菜单
                         #[cfg(target_os = "macos")]
-                        let builder = {
-                            let b = builder.with_icon_templated(icon());
-                            match &current.title {
-                                Some(title) => b.with_title(title),
-                                None => b,
-                            }
-                        };
+                        let builder = builder.with_icon_templated(icon());
                         // Windows：左键打开窗口，右键弹出菜单
                         #[cfg(not(target_os = "macos"))]
                         let builder = builder.with_icon(icon()).with_menu_on_left_click(false);
@@ -207,8 +199,6 @@ impl Tray {
                         update.set_text(state.update_label.as_deref().unwrap_or("检查更新"));
                         if let Some(tray) = &tray {
                             let _ = tray.set_tooltip(Some(&state.tooltip));
-                            #[cfg(target_os = "macos")]
-                            tray.set_title(state.title.as_deref());
                         }
                         current = state;
                     }

@@ -25,6 +25,7 @@ use crate::{
     pull::{self, KeyAction, PasteKeys, Shelf, Source},
     sync::{self, Inbound, LastDigest},
     tray::{self, TrayHandle},
+    update::{self, Updater},
 };
 
 /// 当前连接的主机（界面显示用）。
@@ -45,6 +46,9 @@ pub struct ConnectedHost {
 
 /// 被控端的运行状态，界面和托盘共用。
 pub struct Client {
+    pub updater: Updater,
+    updating: tokio::sync::Mutex<()>,
+    injector: Arc<Mutex<Sink>>,
     pub store: Store,
     pub id: String,
     pub ticket: String,
@@ -63,6 +67,51 @@ pub struct Client {
 }
 
 impl Client {
+    pub async fn update_self(self: Arc<Self>) -> Result<()> {
+        let _guard = self
+            .updating
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("正在更新中"))?;
+        let result: Result<()> = async {
+            let mirror = self.store.load()?.update_mirror;
+            let Some(bin) = self.updater.prepare_self_update(mirror.as_deref()).await? else {
+                return Ok(());
+            };
+            self.updater.set_phase(Some("正在安装本机更新…".into()));
+            let exe = update::install(&bin)?;
+            self.updater
+                .set_phase(Some("本机更新已安装，马上重启…".into()));
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            for conn in self.sessions.lock().unwrap().values() {
+                conn.close(0u32.into(), b"self update");
+            }
+            self.injector.lock().unwrap().release_all();
+            update::restart_at(&exe);
+        }
+        .await;
+        self.updater.set_phase(None);
+        if let Err(err) = &result {
+            self.updater.set_error(Some(format!("更新失败：{err:#}")));
+        }
+        self.refresh_tray();
+        result
+    }
+
+    pub async fn push_keyboard_settings(&self) -> Result<()> {
+        let keyboard = self.store.load()?.input.keyboard;
+        let profile = if Os::current() == Os::MacOs {
+            keyboard.windows_to_mac
+        } else {
+            keyboard.mac_to_windows
+        };
+        let conns: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        for conn in conns {
+            crate::clipboard::send_side(&conn, roam_proto::side::KEYBOARD_MAPPING, &profile)
+                .await?;
+        }
+        Ok(())
+    }
+
     fn file_connection(&self) -> Result<(ConnectedHost, Connection)> {
         let host = self
             .host
@@ -134,7 +183,12 @@ impl Client {
         tracing::info!("被控端「{}」已启动，等待主机连接", config.name);
         tracing::info!("连接码：{code}");
 
+        let updater = Updater::new(&endpoint, store.dir().join("updates"))?;
+        let elevated_blocked = Arc::default();
         let client = Arc::new(Self {
+            updater,
+            updating: tokio::sync::Mutex::new(()),
+            injector: Arc::new(Mutex::new(Sink::new(Arc::clone(&elevated_blocked)))),
             store,
             id,
             ticket: code,
@@ -143,18 +197,34 @@ impl Client {
             pending: Mutex::new(None),
             sessions: Mutex::new(std::collections::HashMap::new()),
             permission,
-            elevated_blocked: Default::default(),
+            elevated_blocked,
             tray: Mutex::new(None),
             _advertiser: advertiser,
         });
         client.refresh_tray();
+        let checking = client.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            loop {
+                let _ = checking.updater.check().await;
+                tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+            }
+        });
         tokio::spawn(client.clone().accept_loop(endpoint));
         Ok(client)
     }
 
-    pub fn set_tray(&self, tray: TrayHandle) {
+    pub fn set_tray(self: &Arc<Self>, tray: TrayHandle) {
         *self.tray.lock().unwrap() = Some(tray);
         self.refresh_tray();
+        let client = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                client.refresh_tray();
+            }
+        });
     }
 
     /// 托盘上显示的状态。
@@ -186,17 +256,25 @@ impl Client {
         if let Some(tray) = &*self.tray.lock().unwrap() {
             let status = self.status_text();
             tray.update(tray::State {
-                title: None,
                 tooltip: format!("Roam 被控端 v{} · {status}", roam_proto::VERSION),
                 status,
                 paused: false,
-                update_label: None,
+                update_label: {
+                    let u = self.updater.state.lock().unwrap();
+                    Some(u.phase.clone().unwrap_or_else(|| {
+                        if u.available {
+                            "更新本机并重启".into()
+                        } else {
+                            "检查更新".into()
+                        }
+                    }))
+                },
             });
         }
     }
 
     async fn accept_loop(self: Arc<Self>, endpoint: iroh::Endpoint) {
-        let injector = Arc::new(Mutex::new(Sink::new(self.elevated_blocked.clone())));
+        let injector = self.injector.clone();
         // 同一时间只弹一个授权窗口
         let prompt_lock = Arc::new(tokio::sync::Mutex::new(()));
         let addr_endpoint = endpoint.clone();
@@ -221,6 +299,10 @@ impl Client {
                 };
                 // 更新通道：只接受已授权主机推送的新版本
                 if conn.alpn() == roam_proto::UPDATE_ALPN {
+                    let Ok(_guard) = client.updating.try_lock() else {
+                        conn.close(0u32.into(), b"update in progress");
+                        return;
+                    };
                     let host_id = conn.remote_id().to_string();
                     let trusted = client
                         .store
@@ -362,6 +444,9 @@ impl Client {
         });
         self.refresh_tray();
         injector.lock().unwrap().reset_sequence();
+        if let Err(err) = self.push_keyboard_settings().await {
+            tracing::warn!("发送键盘映射失败: {err:#}");
+        }
         // 主机定期发心跳（老版本主机不发，收到第一个心跳之前不做判断）
         let health = Arc::new(Mutex::new(LinkHealth::default()));
 
@@ -449,7 +534,7 @@ impl Client {
         let shelf = Arc::new(Shelf::default());
         let side_task = {
             let ctx = Inbound {
-                file_host: None,
+                host: None,
                 peer: host.name.clone(),
                 policy: {
                     let policy = policy.clone();

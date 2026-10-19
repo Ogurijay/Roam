@@ -147,8 +147,8 @@ pub type OnFiles = Arc<dyn Fn(&[PathBuf], bool) -> bool + Send + Sync>;
 
 /// 接收对方发来的单向流的上下文。
 pub struct Inbound {
-    /// 仅主机可以列出组内设备、转发主动发送的文件。
-    pub file_host: Option<Arc<crate::host::Host>>,
+    /// 主机处理组内文件转发及被控端的键盘映射规则。
+    pub host: Option<Arc<crate::host::Host>>,
     pub peer: String,
     /// 当前的同步策略（主机按设置计算，被控端用主机下发的）。
     pub policy: Arc<dyn Fn() -> ClipboardPolicy + Send + Sync>,
@@ -189,7 +189,7 @@ pub(crate) async fn receive_loop_in(conn: Connection, ctx: Inbound, base: PathBu
                     let conn = conn.clone();
                     rt.spawn(async move {
                         let result = if let Some(target) = target {
-                            match &ctx.file_host {
+                            match &ctx.host {
                                 Some(host) => {
                                     let result = host.send_files(&target, tops).await;
                                     let _ =
@@ -241,11 +241,22 @@ pub(crate) async fn receive_loop_in(conn: Connection, ctx: Inbound, base: PathBu
                 }
             };
         match kind {
+            side::KEYBOARD_MAPPING => {
+                if let (Some(host), Ok(profile)) = (
+                    &ctx.host,
+                    clipboard::decode::<roam_core::settings::KeyboardProfile>(&body),
+                ) {
+                    if let Err(err) = host.receiver_keyboard(&conn.remote_id().to_string(), profile)
+                    {
+                        tracing::warn!("拒绝键盘映射: {err:#}");
+                    }
+                }
+            }
             side::FILE_COMMAND => {
                 if let Ok(command) = clipboard::decode::<FileCommand>(&body) {
                     match command {
                         FileCommand::List { request } => {
-                            if let Some(host) = &ctx.file_host {
+                            if let Some(host) = &ctx.host {
                                 let targets = host.file_targets(&conn.remote_id().to_string());
                                 let _ = clipboard::send_side(
                                     &conn,
@@ -270,7 +281,7 @@ pub(crate) async fn receive_loop_in(conn: Connection, ctx: Inbound, base: PathBu
                     Some(target) if *target == conn.remote_id().to_string() => {
                         Err(anyhow::anyhow!("不能把文件转发回发送者"))
                     }
-                    Some(target) => match &ctx.file_host {
+                    Some(target) => match &ctx.host {
                         Some(host) => host.check_file_target(target),
                         None => Err(anyhow::anyhow!("被控端不能转发文件")),
                     },
@@ -282,7 +293,7 @@ pub(crate) async fn receive_loop_in(conn: Connection, ctx: Inbound, base: PathBu
                 }
                 let base = target
                     .as_ref()
-                    .and_then(|_| ctx.file_host.as_ref())
+                    .and_then(|_| ctx.host.as_ref())
                     .map(|host| relay_dir(host, &conn, id));
                 direct.lock().unwrap().insert(id, target);
                 let accepted = match &base {
@@ -349,7 +360,7 @@ pub(crate) async fn receive_loop_in(conn: Connection, ctx: Inbound, base: PathBu
                 let receiver = receiver.clone();
                 let conn = conn.clone();
                 let direct = direct.clone();
-                let host = ctx.file_host.clone();
+                let host = ctx.host.clone();
                 tokio::spawn(async move {
                     let id = header.transfer_id;
                     if let Err(err) = receiver.on_data(header, &mut stream).await {
